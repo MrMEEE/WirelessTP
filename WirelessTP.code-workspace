@@ -1,0 +1,35 @@
+{
+  "folders": [
+    {
+      "name": "WirelessTP",
+      "path": "."
+    },
+    {
+      "name": "console-rp2040",
+      "path": "firmware/console-rp2040"
+    },
+    {
+      "name": "console-esp32",
+      "path": "firmware/console-esp32"
+    },
+    {
+      "name": "pad-esp32",
+      "path": "firmware/pad-esp32"
+    }
+  ],
+  "settings": {
+    "platformio-ide.activateProjectOnTextEditorChange": true,
+    "platformio-ide.autoPreloadEnvTasks": true,
+    "platformio-ide.autoOpenPlatformIOIniFile": false,
+    "files.exclude": {
+      "**/.pio": true,
+      "**/.sconsign*.dblite": true
+    }
+  },
+  "extensions": {
+    "recommendations": [
+      "platformio.platformio-ide",
+      "ms-vscode.cpptools"
+    ]
+  }
+}

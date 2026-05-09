@@ -1,0 +1,1 @@
+Bus 001 Device 020: ID 0e6f:0241 Logic3 LEGO READER V2.10

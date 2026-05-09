@@ -1,0 +1,9 @@
+{
+  "platformio-ide.activateProjectOnTextEditorChange": true,
+  "platformio-ide.autoPreloadEnvTasks": true,
+  "platformio-ide.autoOpenPlatformIOIniFile": false,
+  "files.exclude": {
+    "**/.pio": true,
+    "**/.sconsign*.dblite": true
+  }
+}

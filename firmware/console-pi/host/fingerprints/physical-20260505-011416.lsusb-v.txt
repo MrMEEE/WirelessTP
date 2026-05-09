@@ -1,0 +1,94 @@
+
+Bus 001 Device 021: ID 0e6f:0241 Logic3 LEGO READER V2.10
+Negotiated speed: Full Speed (12Mbps)
+Device Descriptor:
+  bLength                18
+  bDescriptorType         1
+  bcdUSB               2.00
+  bDeviceClass            0 [unknown]
+  bDeviceSubClass         0 [unknown]
+  bDeviceProtocol         0 
+  bMaxPacketSize0        64
+  idVendor           0x0e6f Logic3
+  idProduct          0x0241 LEGO READER V2.10
+  bcdDevice            1.00
+  iManufacturer           1 PDP LIMITED. 
+  iProduct                2 LEGO READER V2.10
+  iSerial                 3 P.D.P.000000
+  bNumConfigurations      1
+  Configuration Descriptor:
+    bLength                 9
+    bDescriptorType         2
+    wTotalLength       0x0029
+    bNumInterfaces          1
+    bConfigurationValue     1
+    iConfiguration          0 
+    bmAttributes         0x80
+      (Bus Powered)
+    MaxPower              500mA
+    Interface Descriptor:
+      bLength                 9
+      bDescriptorType         4
+      bInterfaceNumber        0
+      bAlternateSetting       0
+      bNumEndpoints           2
+      bInterfaceClass         3 Human Interface Device
+      bInterfaceSubClass      0 [unknown]
+      bInterfaceProtocol      0 
+      iInterface              0 
+        HID Device Descriptor:
+          bLength                 9
+          bDescriptorType        33
+          bcdHID               1.00
+          bCountryCode            0 Not supported
+          bNumDescriptors         1
+          bDescriptorType        34 (null)
+          wDescriptorLength      29
+          Report Descriptor: (length is 29)
+            Item(Global): Usage Page, data= [ 0x00 0xff ] 65280
+                            (null)
+            Item(Local ): (null), data= [ 0x01 ] 1
+                            (null)
+            Item(Main  ): (null), data= [ 0x01 ] 1
+                            Application
+            Item(Local ): (null), data= [ 0x01 ] 1
+                            (null)
+            Item(Local ): (null), data= [ 0x20 ] 32
+                            (null)
+            Item(Global): (null), data= [ 0x00 ] 0
+            Item(Global): (null), data= [ 0xff 0x00 ] 255
+            Item(Global): (null), data= [ 0x08 ] 8
+            Item(Global): (null), data= [ 0x20 ] 32
+            Item(Main  ): (null), data= [ 0x00 ] 0
+                            Data Array Absolute No_Wrap Linear
+                            Preferred_State No_Null_Position Non_Volatile Bitfield
+            Item(Local ): (null), data= [ 0x01 ] 1
+                            (null)
+            Item(Local ): (null), data= [ 0x20 ] 32
+                            (null)
+            Item(Main  ): (null), data= [ 0x00 ] 0
+                            Data Array Absolute No_Wrap Linear
+                            Preferred_State No_Null_Position Non_Volatile Bitfield
+            Item(Main  ): (null), data=none
+      Endpoint Descriptor:
+        bLength                 7
+        bDescriptorType         5
+        bEndpointAddress     0x81  EP 1 IN
+        bmAttributes            3
+          Transfer Type            Interrupt
+          Synch Type               None
+          Usage Type               Data
+        wMaxPacketSize     0x0020  1x 32 bytes
+        bInterval               1
+      Endpoint Descriptor:
+        bLength                 7
+        bDescriptorType         5
+        bEndpointAddress     0x01  EP 1 OUT
+        bmAttributes            3
+          Transfer Type            Interrupt
+          Synch Type               None
+          Usage Type               Data
+        wMaxPacketSize     0x0020  1x 32 bytes
+        bInterval               1
+Device Status:     0x0000
+  (Bus Powered)

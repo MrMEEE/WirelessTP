@@ -1,0 +1,1465 @@
+#include <Arduino.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <ctype.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <WebServer.h>
+
+#include "link_protocol.h"
+#include "ld_catalog_data.h"
+
+static const uint16_t kPadListenPort = 25100;
+static const uint32_t kRp2040Baud = 115200;
+static const uint32_t kHelloMs = 3000;
+static const uint16_t kDnsPort = 53;
+static const uint16_t kHttpPort = 80;
+static const uint8_t kSlotCount = 7;
+static const uint8_t kLightZoneCount = 3;
+static const uint8_t kToyboxLimit = 24;
+static const uint32_t kDebugHeartbeatMs = 5000;
+static const uint8_t kUsbCmdMaxLen = 96;
+// Enable USB debug console to forward RP2040 debug messages (LP_MSG_DEBUG) to
+// the ESP32 USB serial port so they can be read without a separate UART adapter.
+static const bool kEnableUsbDebugConsole = true;
+
+enum RuntimeMode : uint8_t {
+  MODE_EMULATOR = 0,
+  MODE_PASSTHROUGH = 1,
+};
+
+typedef struct {
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+} LedZoneState;
+
+typedef struct {
+  bool occupied;
+  uint32_t toyId;
+  char label[24];
+  uint8_t toyType;
+  bool fromToybox;
+  uint8_t toyboxOriginIndex;
+} SlotState;
+
+typedef struct {
+  bool inUse;
+  uint32_t toyId;
+  char label[24];
+  uint8_t toyType;
+} ToyboxEntry;
+
+enum ToyType : uint8_t {
+  TOY_UNKNOWN = 0,
+  TOY_CHARACTER = 1,
+  TOY_VEHICLE = 2,
+};
+
+WiFiUDP udp;
+DNSServer dns;
+WebServer web(kHttpPort);
+Preferences prefs;
+uint8_t seqCounter = 0;
+lp_stream_parser_t uartParser;
+IPAddress padIp;
+uint16_t padPort = 0;
+bool padKnown = false;
+bool padPaired = false;
+uint32_t lastHelloMs = 0;
+uint32_t lastDebugHeartbeatMs = 0;
+String apSsid;
+uint32_t sharedSecret = 0;
+RuntimeMode runtimeMode = MODE_EMULATOR;
+LedZoneState lightZones[kLightZoneCount] = {};
+SlotState padSlots[kSlotCount] = {};
+ToyboxEntry toybox[kToyboxLimit] = {};
+bool piConsoleBridgeMode = false;
+char usbCmdBuf[kUsbCmdMaxLen] = {};
+uint8_t usbCmdLen = 0;
+
+// 3-state ANSI/VT escape filter for Pi console bridge output.
+enum AnsiFilterState : uint8_t {
+  ANSI_NORMAL    = 0,  // pass printable text through
+  ANSI_AFTER_ESC = 1,  // saw 0x1b, waiting for type byte
+  ANSI_IN_CSI    = 2,  // inside ESC [ ... sequence
+  ANSI_IN_OSC    = 3,  // inside ESC ] ... sequence (terminated by BEL or ESC \)
+};
+AnsiFilterState piAnsiState = ANSI_NORMAL;
+
+static const char* kModePrefKey = "mode";
+
+static uint32_t readU32Le(const uint8_t* p);
+static void writeU32Le(uint8_t* p, uint32_t v);
+static bool sendFrameUart(uint8_t type, const uint8_t* payload, uint8_t payloadLen,
+                          uint8_t forceSeq = 0xff);
+static bool sendFrameUdp(uint8_t type, const uint8_t* payload, uint8_t payloadLen,
+                         uint8_t forceSeq = 0xff);
+
+static const char* toyTypeToString(uint8_t toyType);
+static uint8_t toyTypeFromString(const String& s);
+static void sendManifestJson();
+static void sendServiceWorkerJs();
+static void sendAppIconSvg();
+static void processUsbConsole();
+static void processPiConsoleBridge();
+
+static const char kPortalPage[] = R"HTML(
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101827">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Toy Pad Console">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icon.svg">
+  <title>Toy Pad Console</title>
+  <style>
+    :root { --bg:#111827; --panel:#1f2937; --muted:#93a0ba; --ink:#e5e7eb; --accent:#4f46e5; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:linear-gradient(170deg,#101827,#1b2a40); color:var(--ink); font-family:"Trebuchet MS","Segoe UI",sans-serif; }
+    .app { max-width:1160px; margin:0 auto; padding:14px; display:grid; gap:10px; }
+    .card { background:rgba(25,34,52,.88); border:1px solid rgba(255,255,255,.14); border-radius:12px; padding:12px; }
+    .top { display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; }
+    .mode-pill { display:inline-flex; background:#202a3d; padding:4px; border-radius:999px; gap:6px; }
+    .mode-pill button { border:0; background:transparent; color:var(--ink); border-radius:999px; padding:6px 10px; font-weight:700; }
+    .mode-pill button.active { background:#f4b740; color:#222; }
+    .install-btn { border:1px solid rgba(255,255,255,.25); background:#2f855a; color:#fff; border-radius:999px; padding:6px 12px; font-weight:700; display:none; }
+    .install-btn.visible { display:inline-block; }
+    .layout { display:grid; grid-template-columns:1fr; gap:10px; }
+    .stack { display:grid; gap:10px; }
+    .toggle-row { display:flex; gap:8px; flex-wrap:wrap; }
+    .toggle-row button { border:1px solid rgba(255,255,255,.2); background:#23314c; color:var(--ink); border-radius:8px; padding:7px 10px; font-weight:700; }
+    .toggle-row button.active { background:#3e6acc; border-color:#76a4ff; }
+    .filter-row { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }
+    .catalog-search { width:100%; margin-top:8px; background:#192438; color:var(--ink); border:1px solid rgba(255,255,255,.22); border-radius:8px; padding:8px; }
+    .catalog-list { max-height:260px; overflow-y:auto; display:grid; gap:6px; margin-top:8px; }
+    .catalog-item { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center; background:#162032; border:1px solid rgba(255,255,255,.12); border-radius:8px; padding:8px; font-size:.84rem; }
+    .catalog-item small { color:var(--muted); display:block; }
+    .catalog-item .actions { display:flex; gap:4px; }
+    .catalog-item button { border:0; border-radius:7px; background:#4f7ce7; color:#fff; font-weight:700; padding:6px 8px; font-size:.78rem; }
+    .catalog-item button:hover { background:#5a8ff5; }
+    .token { border:0; border-radius:10px; min-height:66px; font-size:.76rem; font-weight:700; padding:12px 10px 10px; margin:2px; cursor:grab; }
+    .token.character { background:linear-gradient(160deg,#7ed5ff,#4a85c0); color:#0c2538; }
+    .token.vehicle { background:linear-gradient(160deg,#ffca75,#e2852c); color:#2d1808; }
+    .token.selected { outline:3px solid #fff; }
+    .token { position:relative; }
+    .token-remove { position:absolute; top:2px; right:2px; width:16px; height:16px; border-radius:999px; border:0; background:rgba(123,29,24,.85); color:#fff; font-size:10px; line-height:16px; padding:0; font-weight:700; cursor:pointer; }
+    .token-remove:hover { background:rgba(220,38,38,.95); }
+    .touch-note { color:var(--muted); font-size:.82rem; margin-bottom:6px; }
+    .status-row { display:flex; gap:8px; flex-wrap:wrap; }
+    .badge { background:#273552; border:1px solid rgba(255,255,255,.2); border-radius:999px; padding:5px 8px; font-size:.84rem; }
+    .pad-grid { display:grid; grid-template-columns:repeat(5,minmax(46px,1fr)); gap:8px; align-items:center; justify-items:center; }
+    .slot { width:100%; max-width:130px; min-height:76px; border-radius:11px; background:#3b465e; border:1px solid rgba(255,255,255,.25); text-align:center; font-size:.76rem; line-height:1.15; padding:8px; display:flex; align-items:center; justify-content:center; position:relative; color:var(--muted); }
+    .slot.filled { color:#ffffff; text-shadow:0 1px 2px rgba(0,0,0,.7); font-weight:700; }
+    .slot.spacer { visibility:hidden; }
+    .clear-slot { position:absolute; top:4px; right:4px; width:18px; height:18px; border-radius:999px; border:0; background:rgba(123,29,24,.85); color:#fff; font-size:11px; line-height:18px; padding:0; font-weight:700; }
+    .modal-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,.7); z-index:1000; }
+    .modal-overlay.active { display:flex; }
+    .modal-content { background:var(--panel); border:1px solid rgba(255,255,255,.2); border-radius:16px; padding:24px; box-shadow:0 8px 32px rgba(0,0,0,.3); margin:auto; min-width:320px; }
+    .modal-title { font-size:1.2rem; font-weight:700; margin-bottom:16px; color:var(--ink); }
+    .slot-buttons { display:grid; grid-template-columns:repeat(auto-fit,minmax(60px,1fr)); gap:12px; }
+    .slot-button { background:#3e6acc; border:2px solid rgba(255,255,255,.2); border-radius:10px; color:var(--ink); font-weight:700; padding:12px; font-size:1rem; cursor:pointer; }
+    .slot-button:hover { background:#4f7ce7; border-color:#76a4ff; }
+    .install-note { color:var(--muted); font-size:.82rem; margin-top:8px; }
+    @media (max-width:880px) { .layout { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="card top">
+      <div><b>Toy Pad Console Interface</b><div id="subtitle" style="color:var(--muted)">Loading...</div></div>
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <button id="installBtn" class="install-btn">Install App</button>
+        <div class="mode-pill" id="modePill"><button data-mode="emulator">Emulator</button><button data-mode="passthrough">Passthrough</button></div>
+      </div>
+    </div>
+    <div class="card" id="installInfo" style="display:none;"><div class="install-note" id="installNote"></div></div>
+    <div class="card"><div class="status-row" id="statusRow"></div></div>
+    <div class="card"><h3 style="margin-top:0">The Toy Pad (7 slots)</h3><div class="pad-grid" id="padGrid"></div></div>
+    <div class="layout">
+      <div class="stack">
+        <div class="card">
+          <h3 style="margin-top:0">Toy Box</h3>
+          <div class="touch-note" id="touchSelectionState">No toy selected.</div>
+          <div class="toybox" id="toybox"></div>
+        </div>
+        <div class="card">
+          <h3 style="margin-top:0">Catalog</h3>
+          <div class="toggle-row"><button id="toggleCharacters" class="active">Characters</button><button id="toggleVehicles" class="active">Vehicles</button></div>
+          <input id="catalogSearch" class="catalog-search" placeholder="Search by name or ID">
+          <div class="filter-row">
+            <input id="worldFilter" class="catalog-search" style="margin-top:0" placeholder="Filter by world">
+            <input id="abilityFilter" class="catalog-search" style="margin-top:0" placeholder="Filter by ability">
+          </div>
+          <div class="catalog-list" id="catalogList"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="slotModal">
+    <div class="modal-content">
+      <div class="modal-title">Select a Slot</div>
+      <div class="slot-buttons" id="slotButtons"></div>
+    </div>
+  </div>
+
+  <script>
+    const padRows = [[1,0,2,0,3],[4,5,0,6,7]];
+    const FAST_POLL_MS = 250;
+    const SLOW_POLL_MS = 1200;
+    let selectedToyboxIndex = null;
+    let catalog = [];
+    let filterCharacters = true;
+    let filterVehicles = true;
+    let catalogSearch = "";
+    let catalogWorld = "";
+    let catalogAbility = "";
+    let deferredInstallPrompt = null;
+    let refreshTimer = null;
+    let refreshInFlight = false;
+
+    function slotLabel(slot) {
+      if (!slot.occupied) return "Empty";
+      return `${slot.label || "Toy"}<br>0x${Number(slot.toyId).toString(16).toUpperCase()}`;
+    }
+    function slotZone(slotNum) {
+      // LP zone 0=center, 1=left, 2=right
+      // S2 = center; S1,S4,S5 = left; S3,S6,S7 = right
+      if (slotNum === 2) return 0;
+      if (slotNum === 1 || slotNum === 4 || slotNum === 5) return 1;
+      return 2;
+    }
+    function rgbCss(o, a) {
+      return `rgba(${Number(o.r)||0},${Number(o.g)||0},${Number(o.b)||0},${a})`;
+    }
+    function colorHex(c) { return (Number(c)&0xFF).toString(16).padStart(2,"0"); }
+    function rgbHex(o) { return `#${colorHex(o.r)}${colorHex(o.g)}${colorHex(o.b)}`; }
+    async function postJson(url, payload) {
+      const r = await fetch(url, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload||{}) });
+      if (!r.ok) throw new Error(await r.text());
+      return r.text();
+    }
+    function isIos() {
+      return /iphone|ipad|ipod/i.test(navigator.userAgent);
+    }
+    function isInStandalone() {
+      return window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+    }
+    function showInstallNote(text) {
+      const host = document.getElementById("installInfo");
+      const note = document.getElementById("installNote");
+      note.textContent = text;
+      host.style.display = "block";
+    }
+    function setupInstallUx() {
+      const installBtn = document.getElementById("installBtn");
+
+      // Service worker requires HTTPS or localhost. SoftAP IP is typically HTTP only.
+      if ((location.protocol === "https:" || location.hostname === "localhost") && "serviceWorker" in navigator) {
+        navigator.serviceWorker.register("/sw.js").catch(() => {});
+      }
+
+      window.addEventListener("beforeinstallprompt", (e) => {
+        e.preventDefault();
+        deferredInstallPrompt = e;
+        installBtn.classList.add("visible");
+      });
+
+      installBtn.onclick = async () => {
+        if (deferredInstallPrompt) {
+          deferredInstallPrompt.prompt();
+          await deferredInstallPrompt.userChoice;
+          deferredInstallPrompt = null;
+          installBtn.classList.remove("visible");
+          return;
+        }
+        if (isIos()) {
+          showInstallNote("On iPhone/iPad: Share -> Add to Home Screen.");
+          return;
+        }
+        showInstallNote("On Android: browser menu -> Add to Home screen. Full install prompt may require HTTPS.");
+      };
+
+      if (isIos() && !isInStandalone()) {
+        installBtn.classList.add("visible");
+      }
+    }
+    async function loadCatalog() {
+      if (catalog.length) return;
+      const r = await fetch("/api/catalog", { cache:"force-cache" });
+      catalog = await r.json();
+      renderCatalog();
+    }
+    function passesCatalogFilter(item) {
+      if (item.type === "character" && !filterCharacters) return false;
+      if (item.type === "vehicle" && !filterVehicles) return false;
+      const q = catalogSearch.toLowerCase();
+      const worldQ = catalogWorld.toLowerCase();
+      const abilityQ = catalogAbility.toLowerCase();
+      const nameMatch = !q || item.name.toLowerCase().includes(q) || String(item.id).includes(q);
+      const worldMatch = !worldQ || (item.world || "").toLowerCase().includes(worldQ);
+      const abilityMatch = !abilityQ || (item.abilities || "").toLowerCase().includes(abilityQ);
+      return nameMatch && worldMatch && abilityMatch;
+    }
+    function showSlotModal() {
+      return new Promise((resolve) => {
+        const modal = document.getElementById("slotModal");
+        const buttonsContainer = document.getElementById("slotButtons");
+        buttonsContainer.innerHTML = Array.from({length: 7}, (_, i) => i + 1).map(slot => 
+          `<button class="slot-button" data-slot-select="${slot}">Slot ${slot}</button>`
+        ).join("");
+        modal.classList.add("active");
+        buttonsContainer.querySelectorAll("button").forEach(btn => {
+          btn.onclick = () => {
+            modal.classList.remove("active");
+            resolve(parseInt(btn.dataset.slotSelect));
+          };
+        });
+        // Close on background click
+        modal.onclick = (e) => {
+          if (e.target === modal) {
+            modal.classList.remove("active");
+            resolve(null);
+          }
+        };
+      });
+    }
+    function renderCatalog() {
+      const list = document.getElementById("catalogList");
+      const entries = catalog.filter(passesCatalogFilter);
+      list.innerHTML = entries.map((item) => `<div class="catalog-item"><div>${item.name}<small>${item.type} | 0x${Number(item.id).toString(16).toUpperCase()} | ${item.world || "Unknown"}</small></div><div class="actions"><button data-add-id="${item.id}" data-add-name="${item.name.replace(/"/g,"&quot;")}" data-add-type="${item.type}" title="Add to Toy Box">📦</button><button data-play-id="${item.id}" data-play-name="${item.name.replace(/"/g,"&quot;")}" data-play-type="${item.type}" title="Play (place on pad)">▶</button></div></div>`).join("");
+      list.querySelectorAll("button[data-add-id]").forEach((btn) => {
+        btn.onclick = async () => {
+          try {
+            await postJson("/api/toybox/add", { id:Number(btn.dataset.addId), label:btn.dataset.addName, type:btn.dataset.addType });
+            await refresh();
+          } catch (e) {
+            alert("Add failed: " + e.message);
+          }
+        };
+      });
+      list.querySelectorAll("button[data-play-id]").forEach((btn) => {
+        btn.onclick = async () => {
+          const slot = await showSlotModal();
+          if (slot === null) return;
+          try {
+            await postJson("/api/slot/place", { slot: slot, id:Number(btn.dataset.playId), label:btn.dataset.playName, type:btn.dataset.playType });
+            await refresh();
+          } catch (e) {
+            alert("Place failed: " + e.message);
+          }
+        };
+      });
+    }
+    function installModeButtons() {
+      document.querySelectorAll("#modePill button").forEach((btn) => {
+        btn.onclick = async () => {
+          try { await postJson("/api/mode", { mode: btn.dataset.mode }); await refresh(); }
+          catch (e) { alert("Failed to set mode: " + e.message); }
+        };
+      });
+    }
+    function installCatalogControls() {
+      const c = document.getElementById("toggleCharacters");
+      const v = document.getElementById("toggleVehicles");
+      const s = document.getElementById("catalogSearch");
+      const w = document.getElementById("worldFilter");
+      const a = document.getElementById("abilityFilter");
+      c.onclick = () => { filterCharacters = !filterCharacters; c.classList.toggle("active", filterCharacters); renderCatalog(); };
+      v.onclick = () => { filterVehicles = !filterVehicles; v.classList.toggle("active", filterVehicles); renderCatalog(); };
+      s.oninput = () => { catalogSearch = s.value.trim(); renderCatalog(); };
+      w.oninput = () => { catalogWorld = w.value.trim(); renderCatalog(); };
+      a.oninput = () => { catalogAbility = a.value.trim(); renderCatalog(); };
+    }
+    function updateSelectionState(data) {
+      const host = document.getElementById("touchSelectionState");
+      const toy = data.toybox.find((t) => t.index === selectedToyboxIndex);
+      host.textContent = toy ? `Selected: ${toy.label} (tap slot to place)` : "No toy selected.";
+    }
+    function installDragAndDrop(data) {
+      const touchMode = ("ontouchstart" in window) || navigator.maxTouchPoints > 0;
+      const tokens = document.querySelectorAll(".token");
+      tokens.forEach((el) => {
+        el.draggable = !touchMode;
+        el.ondragstart = (e) => e.dataTransfer.setData("text/plain", el.dataset.index);
+        el.onclick = () => {
+          selectedToyboxIndex = Number(el.dataset.index);
+          tokens.forEach((t) => t.classList.toggle("selected", Number(t.dataset.index) === selectedToyboxIndex));
+          updateSelectionState(data);
+        };
+      });
+      document.querySelectorAll(".slot.drop").forEach((el) => {
+        el.ondragover = (e) => e.preventDefault();
+        el.ondrop = async (e) => {
+          e.preventDefault();
+          const idx = Number(e.dataTransfer.getData("text/plain"));
+          const toy = data.toybox.find((t) => t.index === idx);
+          if (!toy) return;
+          try {
+            await postJson("/api/slot/place", { slot:Number(el.dataset.slot), id:toy.toyId, label:toy.label, type:toy.type, toyboxIndex:toy.index });
+            await refresh();
+          } catch (err) { alert("Place failed: " + err.message); }
+        };
+        el.onclick = async () => {
+          if (selectedToyboxIndex === null) return;
+          const toy = data.toybox.find((t) => t.index === selectedToyboxIndex);
+          if (!toy) return;
+          try {
+            await postJson("/api/slot/place", { slot:Number(el.dataset.slot), id:toy.toyId, label:toy.label, type:toy.type, toyboxIndex:toy.index });
+            selectedToyboxIndex = null;
+            await refresh();
+          } catch (err) { alert("Place failed: " + err.message); }
+        };
+        el.ondblclick = async () => {
+          try { await postJson("/api/slot/clear", { slot:Number(el.dataset.slot) }); await refresh(); }
+          catch (err) { alert("Clear failed: " + err.message); }
+        };
+      });
+      document.querySelectorAll(".clear-slot").forEach((btn) => {
+        btn.onclick = async (e) => {
+          e.stopPropagation();
+          try { await postJson("/api/slot/clear", { slot:Number(btn.dataset.clear) }); await refresh(); }
+          catch (err) { alert("Clear failed: " + err.message); }
+        };
+      });
+    }
+    function render(data) {
+      document.getElementById("subtitle").textContent = `SSID ${data.ssid} | ${data.mode.toUpperCase()} mode`;
+      document.querySelectorAll("#modePill button").forEach((btn) => btn.classList.toggle("active", btn.dataset.mode === data.mode));
+      document.getElementById("statusRow").innerHTML = [
+        `<span class="badge">Pad ${data.paired ? "Paired" : "Waiting"}</span>`,
+        `<span class="badge">Endpoint: ${data.paired ? data.padEndpoint : "-"}</span>`,
+        `<span class="badge">Secret: ${data.hasSecret ? "yes" : "no"}</span>`,
+        `<span class="badge">Touch: tap toy then slot</span>`
+      ].join("");
+      document.getElementById("toybox").innerHTML = data.toybox.map((t) => `<button class="token ${t.type}" data-index="${t.index}"><span class="token-remove" data-remove-idx="${t.index}" title="Remove from toybox">×</span>${t.label}<br>0x${Number(t.toyId).toString(16).toUpperCase()}</button>`).join("") || `<div style="color:var(--muted)">Toy box is empty.</div>`;
+      document.querySelectorAll(".token-remove").forEach((btn) => {
+        btn.onclick = async (e) => {
+          e.stopPropagation();
+          try { await postJson("/api/toybox/remove", { index:Number(btn.dataset.removeIdx) }); await refresh(); }
+          catch (err) { alert("Remove failed: " + err.message); }
+        };
+      });
+      document.getElementById("padGrid").innerHTML = padRows.flatMap((row) => row).map((slotNum) => {
+        if (!slotNum) return `<div class="slot spacer"></div>`;
+        const s = data.slots[slotNum - 1];
+        const zone = slotZone(slotNum);
+        const light = data.lights[zone] || { r: 59, g: 70, b: 94 };
+        const slotStyle = `background:${rgbCss(light, 0.3)}; border-color:${rgbCss(light, 0.9)};`;
+        const clear = s.occupied ? `<button class="clear-slot" data-clear="${slotNum}">x</button>` : "";
+        return `<div class="slot ${s.occupied ? "filled" : ""} drop" data-slot="${slotNum}" style="${slotStyle}">S${slotNum}<br>${slotLabel(s)}${clear}</div>`;
+      }).join("");
+      updateSelectionState(data);
+      installDragAndDrop(data);
+    }
+    async function refresh() {
+      if (refreshInFlight) return;
+      refreshInFlight = true;
+      try {
+        const r = await fetch("/api/state", { cache:"no-store" });
+        const data = await r.json();
+        render(data);
+      } finally {
+        refreshInFlight = false;
+      }
+    }
+    function scheduleRefresh() {
+      if (refreshTimer) {
+        clearInterval(refreshTimer);
+      }
+      const period = document.hidden ? SLOW_POLL_MS : FAST_POLL_MS;
+      refreshTimer = setInterval(() => {
+        refresh().catch(() => {});
+      }, period);
+    }
+    installModeButtons();
+    installCatalogControls();
+    setupInstallUx();
+    document.addEventListener("visibilitychange", scheduleRefresh);
+    loadCatalog().then(() => refresh()).catch(() => {});
+    scheduleRefresh();
+  </script>
+</body>
+</html>
+)HTML";
+
+  static const char kManifestJson[] =
+    "{"
+    "\"name\":\"Toy Pad Console\"," 
+    "\"short_name\":\"ToyPad\"," 
+    "\"start_url\":\"/\"," 
+    "\"scope\":\"/\"," 
+    "\"display\":\"standalone\"," 
+    "\"background_color\":\"#101827\"," 
+    "\"theme_color\":\"#101827\"," 
+    "\"icons\":[{\"src\":\"/icon.svg\",\"sizes\":\"any\",\"type\":\"image/svg+xml\",\"purpose\":\"any maskable\"}]"
+    "}";
+
+  static const char kServiceWorkerJs[] =
+    "const CACHE='toypad-console-v1';\n"
+    "self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(['/','/manifest.webmanifest','/icon.svg'])));self.skipWaiting();});\n"
+    "self.addEventListener('activate',e=>{e.waitUntil(self.clients.claim());});\n"
+    "self.addEventListener('fetch',e=>{if(e.request.method!=='GET')return;e.respondWith(caches.match(e.request).then(r=>r||fetch(e.request).then(resp=>{const copy=resp.clone();caches.open(CACHE).then(c=>c.put(e.request,copy));return resp;}).catch(()=>r)));});\n";
+
+  static const char kAppIconSvg[] =
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'>"
+    "<defs><linearGradient id='g' x1='0' x2='1' y1='0' y2='1'><stop offset='0' stop-color='#1f2937'/><stop offset='1' stop-color='#0f172a'/></linearGradient></defs>"
+    "<rect width='192' height='192' rx='38' fill='url(#g)'/>"
+    "<circle cx='52' cy='98' r='24' fill='#60a5fa'/><circle cx='96' cy='98' r='24' fill='#34d399'/><circle cx='140' cy='98' r='24' fill='#f59e0b'/>"
+    "<rect x='36' y='38' width='120' height='18' rx='9' fill='#f4b740'/>"
+    "<text x='96' y='166' font-size='20' text-anchor='middle' fill='#e5e7eb' font-family='Trebuchet MS, Segoe UI, sans-serif'>Toy Pad</text>"
+    "</svg>";
+
+static void safeCopyLabel(char* out, size_t outLen, const String& value) {
+  if (outLen == 0) {
+    return;
+  }
+  size_t n = value.length();
+  if (n >= outLen) {
+    n = outLen - 1;
+  }
+  memcpy(out, value.c_str(), n);
+  out[n] = '\0';
+}
+
+static const char* modeToString(RuntimeMode mode) {
+  return (mode == MODE_PASSTHROUGH) ? "passthrough" : "emulator";
+}
+
+static RuntimeMode modeFromString(const String& s) {
+  if (s == "passthrough") {
+    return MODE_PASSTHROUGH;
+  }
+  return MODE_EMULATOR;
+}
+
+static const char* toyTypeToString(uint8_t toyType) {
+  if (toyType == TOY_CHARACTER) {
+    return "character";
+  }
+  if (toyType == TOY_VEHICLE) {
+    return "vehicle";
+  }
+  return "unknown";
+}
+
+static uint8_t toyTypeFromString(const String& s) {
+  if (s == "character") {
+    return TOY_CHARACTER;
+  }
+  if (s == "vehicle") {
+    return TOY_VEHICLE;
+  }
+  return TOY_UNKNOWN;
+}
+
+static bool parseJsonString(const String& body, const char* key, String& out) {
+  const String needle = String("\"") + key + "\"";
+  int keyPos = body.indexOf(needle);
+  if (keyPos < 0) {
+    return false;
+  }
+  int colonPos = body.indexOf(':', keyPos + needle.length());
+  if (colonPos < 0) {
+    return false;
+  }
+  int valueStart = colonPos + 1;
+  while (valueStart < (int)body.length() && isspace((unsigned char)body[valueStart])) {
+    valueStart++;
+  }
+  // Only parse JSON strings when the value itself starts with a quote.
+  if (valueStart >= (int)body.length() || body[valueStart] != '"') {
+    return false;
+  }
+  int firstQuote = valueStart;
+  if (firstQuote < 0) {
+    return false;
+  }
+  int secondQuote = body.indexOf('"', firstQuote + 1);
+  if (secondQuote < 0) {
+    return false;
+  }
+  out = body.substring(firstQuote + 1, secondQuote);
+  return true;
+}
+
+static bool parseJsonUint(const String& body, const char* key, uint32_t* outValue) {
+  const String needle = String("\"") + key + "\"";
+  int keyPos = body.indexOf(needle);
+  if (keyPos < 0) {
+    return false;
+  }
+  int colonPos = body.indexOf(':', keyPos + needle.length());
+  if (colonPos < 0) {
+    return false;
+  }
+
+  int start = colonPos + 1;
+  while (start < (int)body.length() && isspace((unsigned char)body[start])) {
+    start++;
+  }
+  if (start >= (int)body.length()) {
+    return false;
+  }
+
+  int end = start;
+  while (end < (int)body.length() && body[end] != ',' && body[end] != '}' && body[end] != '"') {
+    end++;
+  }
+  String token = body.substring(start, end);
+  token.trim();
+  if (token.length() == 0) {
+    return false;
+  }
+
+  if (token.startsWith("0x") || token.startsWith("0X")) {
+    *outValue = strtoul(token.c_str() + 2, NULL, 16);
+  } else {
+    *outValue = strtoul(token.c_str(), NULL, 10);
+  }
+  return true;
+}
+
+static bool parseJsonFlexibleId(const String& body, const char* key, uint32_t* outValue) {
+  String token;
+  if (parseJsonString(body, key, token)) {
+    token.trim();
+    if (token.startsWith("0x") || token.startsWith("0X")) {
+      *outValue = strtoul(token.c_str() + 2, NULL, 16);
+    } else {
+      *outValue = strtoul(token.c_str(), NULL, 10);
+    }
+    return true;
+  }
+  return parseJsonUint(body, key, outValue);
+}
+
+static void clearSlotState(uint8_t slotIndex) {
+  if (slotIndex >= kSlotCount) {
+    return;
+  }
+  padSlots[slotIndex].occupied = false;
+  padSlots[slotIndex].toyId = 0;
+  padSlots[slotIndex].toyType = TOY_UNKNOWN;
+  padSlots[slotIndex].label[0] = '\0';
+  padSlots[slotIndex].fromToybox = false;
+  padSlots[slotIndex].toyboxOriginIndex = 0xff;
+}
+
+static void setSlotState(uint8_t slotIndex, uint32_t toyId, const char* label, uint8_t toyType,
+                        bool fromToybox = false, uint8_t toyboxOriginIndex = 0xff) {
+  if (slotIndex >= kSlotCount) {
+    return;
+  }
+  padSlots[slotIndex].occupied = true;
+  padSlots[slotIndex].toyId = toyId;
+  padSlots[slotIndex].toyType = toyType;
+  padSlots[slotIndex].fromToybox = fromToybox;
+  padSlots[slotIndex].toyboxOriginIndex = toyboxOriginIndex;
+  if (label != NULL) {
+    strncpy(padSlots[slotIndex].label, label, sizeof(padSlots[slotIndex].label) - 1);
+    padSlots[slotIndex].label[sizeof(padSlots[slotIndex].label) - 1] = '\0';
+  } else {
+    snprintf(padSlots[slotIndex].label, sizeof(padSlots[slotIndex].label), "Toy %lu",
+             (unsigned long)toyId);
+  }
+}
+
+static void setLightZone(uint8_t zone, uint8_t r, uint8_t g, uint8_t b) {
+  if (zone >= kLightZoneCount) {
+    return;
+  }
+  lightZones[zone].r = r;
+  lightZones[zone].g = g;
+  lightZones[zone].b = b;
+}
+
+static void setAllLightZones(uint8_t r, uint8_t g, uint8_t b) {
+  for (uint8_t i = 0; i < kLightZoneCount; i++) {
+    setLightZone(i, r, g, b);
+  }
+}
+
+static void observeFrameState(const lp_frame_t& frame) {
+  if (frame.header.type == LP_MSG_LED_CMD && frame.header.length >= 4) {
+    const uint8_t zone = frame.payload[0];
+    const uint8_t r = frame.payload[1];
+    const uint8_t g = frame.payload[2];
+    const uint8_t b = frame.payload[3];
+    if (zone == 0xff) {
+      setAllLightZones(r, g, b);
+    } else {
+      setLightZone(zone, r, g, b);
+    }
+    return;
+  }
+
+  if (frame.header.type == LP_MSG_TAG_SET && frame.header.length >= 5) {
+    const uint8_t slotNum = frame.payload[0];
+    if (slotNum >= 1 && slotNum <= kSlotCount) {
+      const uint32_t toyId = readU32Le(&frame.payload[1]);
+      setSlotState(slotNum - 1, toyId, NULL, TOY_UNKNOWN);
+    }
+    return;
+  }
+
+  if (frame.header.type == LP_MSG_TAG_CLEAR && frame.header.length >= 1) {
+    const uint8_t slotNum = frame.payload[0];
+    if (slotNum >= 1 && slotNum <= kSlotCount) {
+      clearSlotState(slotNum - 1);
+    }
+    return;
+  }
+}
+
+// Maps web UI slot number (1-7) to LP zone (0=center, 1=left, 2=right).
+// Matches the slotZone() function in the web UI JavaScript.
+// S2 = center (LP 0); S1,S4,S5 = left pad (LP 1); S3,S6,S7 = right pad (LP 2).
+static uint8_t slotToLpZone(uint8_t slotNum) {
+  if (slotNum == 2) return 0;
+  if (slotNum == 1 || slotNum == 4 || slotNum == 5) return 1;
+  return 2;
+}
+
+static bool sendTagSet(uint8_t slot, uint32_t toyId) {
+  uint8_t payload[5];
+  payload[0] = slot;  // slot (1-7) lets the RP2040 assign a unique figure index
+  writeU32Le(&payload[1], toyId);
+  bool ok = sendFrameUart(LP_MSG_TAG_SET, payload, sizeof(payload));
+  if (padKnown && padPaired) {
+    sendFrameUdp(LP_MSG_TAG_SET, payload, sizeof(payload));
+  }
+  return ok;
+}
+
+static bool sendTagClear(uint8_t slot) {
+  const uint8_t payload[1] = {slot};  // slot (1-7) matches the index used in TAG_SET
+  bool ok = sendFrameUart(LP_MSG_TAG_CLEAR, payload, sizeof(payload));
+  if (padKnown && padPaired) {
+    sendFrameUdp(LP_MSG_TAG_CLEAR, payload, sizeof(payload));
+  }
+  return ok;
+}
+
+static int firstFreeToyboxIndex() {
+  for (int i = 0; i < (int)kToyboxLimit; i++) {
+    if (!toybox[i].inUse) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static bool toyboxContains(uint32_t toyId) {
+  for (int i = 0; i < (int)kToyboxLimit; i++) {
+    if (toybox[i].inUse && toybox[i].toyId == toyId) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool toyIsOnPad(uint32_t toyId) {
+  for (int i = 0; i < (int)kSlotCount; i++) {
+    if (padSlots[i].occupied && padSlots[i].toyId == toyId) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void addToyboxEntry(uint32_t toyId, const String& label, uint8_t toyType) {
+  // Prevent duplicates - each toy can only be added once
+  if (toyboxContains(toyId)) {
+    return;
+  }
+  int idx = firstFreeToyboxIndex();
+  if (idx < 0) {
+    return;
+  }
+  toybox[idx].inUse = true;
+  toybox[idx].toyId = toyId;
+  toybox[idx].toyType = toyType;
+  safeCopyLabel(toybox[idx].label, sizeof(toybox[idx].label), label);
+}
+
+static void removeToyboxEntry(uint8_t idx) {
+  if (idx >= kToyboxLimit) {
+    return;
+  }
+  toybox[idx].inUse = false;
+  toybox[idx].toyId = 0;
+  toybox[idx].toyType = TOY_UNKNOWN;
+  toybox[idx].label[0] = '\0';
+}
+
+static void sendCatalogJson() {
+  web.send_P(200, "application/json", kLdCatalogJson, kLdCatalogJsonLen);
+}
+
+static void sendManifestJson() {
+  web.send(200, "application/manifest+json", kManifestJson);
+}
+
+static void sendServiceWorkerJs() {
+  web.send(200, "application/javascript", kServiceWorkerJs);
+}
+
+static void sendAppIconSvg() {
+  web.send(200, "image/svg+xml", kAppIconSvg);
+}
+
+static void loadMode() {
+  prefs.begin("console", true);
+  const String modeStr = prefs.getString(kModePrefKey, "emulator");
+  prefs.end();
+  runtimeMode = modeFromString(modeStr);
+}
+
+static void saveMode() {
+  prefs.begin("console", false);
+  prefs.putString(kModePrefKey, modeToString(runtimeMode));
+  prefs.end();
+}
+
+static void sendStateJson() {
+  String json = "{";
+  json += "\"mode\":\"";
+  json += modeToString(runtimeMode);
+  json += "\",";
+  json += "\"ssid\":\"";
+  json += apSsid;
+  json += "\",";
+  json += "\"paired\":";
+  json += (padPaired ? "true" : "false");
+  json += ",";
+  json += "\"padEndpoint\":\"";
+  if (padPaired) {
+    json += padIp.toString();
+    json += ":";
+    json += String(padPort);
+  } else {
+    json += "-";
+  }
+  json += "\",";
+  json += "\"hasSecret\":";
+  json += (sharedSecret != 0 ? "true" : "false");
+  json += ",";
+
+  json += "\"lights\":[";
+  for (uint8_t i = 0; i < kLightZoneCount; i++) {
+    if (i > 0) {
+      json += ",";
+    }
+    json += "{\"r\":" + String(lightZones[i].r) + ",\"g\":" +
+            String(lightZones[i].g) + ",\"b\":" + String(lightZones[i].b) + "}";
+  }
+  json += "],";
+
+  json += "\"slots\":[";
+  for (uint8_t i = 0; i < kSlotCount; i++) {
+    if (i > 0) {
+      json += ",";
+    }
+    json += "{";
+    json += "\"occupied\":";
+    json += (padSlots[i].occupied ? "true" : "false");
+    json += ",\"toyId\":" + String((unsigned long)padSlots[i].toyId);
+    json += ",\"type\":\"" + String(toyTypeToString(padSlots[i].toyType)) + "\"";
+    json += ",\"label\":\"";
+    json += String(padSlots[i].label);
+    json += "\"}";
+  }
+  json += "],";
+
+  json += "\"toybox\":[";
+  bool first = true;
+  for (uint8_t i = 0; i < kToyboxLimit; i++) {
+    if (!toybox[i].inUse) {
+      continue;
+    }
+    if (!first) {
+      json += ",";
+    }
+    first = false;
+    json += "{";
+    json += "\"index\":" + String(i);
+    json += ",\"toyId\":" + String((unsigned long)toybox[i].toyId);
+    json += ",\"type\":\"" + String(toyTypeToString(toybox[i].toyType)) + "\"";
+    json += ",\"label\":\"" + String(toybox[i].label) + "\"";
+    json += "}";
+  }
+  json += "]";
+  json += "}";
+
+  web.send(200, "application/json", json);
+}
+
+static void handleApiMode() {
+  const String body = web.arg("plain");
+  String modeStr;
+  if (!parseJsonString(body, "mode", modeStr)) {
+    web.send(400, "text/plain", "missing mode");
+    return;
+  }
+  runtimeMode = modeFromString(modeStr);
+  saveMode();
+  web.send(200, "text/plain", "ok");
+}
+
+static void handleApiToyboxAdd() {
+  const String body = web.arg("plain");
+  uint32_t toyId = 0;
+  String label;
+  String type;
+  if (!parseJsonFlexibleId(body, "id", &toyId) || !parseJsonString(body, "label", label)) {
+    web.send(400, "text/plain", "missing id/label");
+    return;
+  }
+  label.trim();
+  if (label.length() == 0) {
+    web.send(400, "text/plain", "empty label");
+    return;
+  }
+  
+  if (!parseJsonString(body, "type", type)) {
+    type = "unknown";
+  }
+  addToyboxEntry(toyId, label, toyTypeFromString(type));
+  web.send(200, "text/plain", "ok");
+}
+
+static void handleApiSlotPlace() {
+  if (runtimeMode != MODE_EMULATOR) {
+    web.send(409, "text/plain", "slot control disabled in passthrough mode");
+    return;
+  }
+
+  const String body = web.arg("plain");
+  uint32_t slot = 0;
+  uint32_t toyId = 0;
+  String label;
+  String type;
+  uint32_t toyboxIndex = 0;
+  bool isToyboxDirect = false;
+
+  if (!parseJsonUint(body, "slot", &slot) || !parseJsonFlexibleId(body, "id", &toyId) ||
+      !parseJsonString(body, "label", label)) {
+    web.send(400, "text/plain", "missing slot/id/label");
+    return;
+  }
+
+  if (slot < 1 || slot > kSlotCount) {
+    web.send(400, "text/plain", "invalid slot");
+    return;
+  }
+
+  sendTagSet((uint8_t)slot, toyId);
+  if (!parseJsonString(body, "type", type)) {
+    type = "unknown";
+  }
+
+  if (parseJsonUint(body, "toyboxIndex", &toyboxIndex)) {
+    // Toy is being placed from the toybox; remove it from toybox
+    removeToyboxEntry((uint8_t)toyboxIndex);
+    isToyboxDirect = true;
+    setSlotState((uint8_t)(slot - 1), toyId, label.c_str(), toyTypeFromString(type),
+                 true, (uint8_t)toyboxIndex);
+  } else {
+    // Toy is being placed directly from catalog (without adding to toybox first)
+    setSlotState((uint8_t)(slot - 1), toyId, label.c_str(), toyTypeFromString(type),
+                 false, 0xff);
+  }
+
+  web.send(200, "text/plain", "ok");
+}
+
+static void handleApiSlotClear() {
+  if (runtimeMode != MODE_EMULATOR) {
+    web.send(409, "text/plain", "slot control disabled in passthrough mode");
+    return;
+  }
+
+  const String body = web.arg("plain");
+  uint32_t slot = 0;
+  if (!parseJsonUint(body, "slot", &slot) || slot < 1 || slot > kSlotCount) {
+    web.send(400, "text/plain", "invalid slot");
+    return;
+  }
+
+  const uint8_t slotIndex = (uint8_t)(slot - 1);
+  const SlotState& s = padSlots[slotIndex];
+
+  // If this toy came from the toybox, restore it
+  if (s.fromToybox && s.toyboxOriginIndex < kToyboxLimit && s.occupied) {
+    // Try to restore to the original toybox index first
+    if (!toybox[s.toyboxOriginIndex].inUse) {
+      toybox[s.toyboxOriginIndex].inUse = true;
+      toybox[s.toyboxOriginIndex].toyId = s.toyId;
+      toybox[s.toyboxOriginIndex].toyType = s.toyType;
+      strncpy(toybox[s.toyboxOriginIndex].label, s.label, sizeof(toybox[s.toyboxOriginIndex].label) - 1);
+      toybox[s.toyboxOriginIndex].label[sizeof(toybox[s.toyboxOriginIndex].label) - 1] = '\0';
+    } else {
+      // If original index is taken, find a new free slot
+      addToyboxEntry(s.toyId, String(s.label), s.toyType);
+    }
+  }
+
+  sendTagClear((uint8_t)slot);
+  clearSlotState(slotIndex);
+  web.send(200, "text/plain", "ok");
+}
+
+static void handleApiToyboxRemove() {
+  const String body = web.arg("plain");
+  uint32_t index = 0;
+  if (!parseJsonUint(body, "index", &index) || index >= kToyboxLimit) {
+    web.send(400, "text/plain", "invalid index");
+    return;
+  }
+  removeToyboxEntry((uint8_t)index);
+  web.send(200, "text/plain", "ok");
+}
+
+static void handlePortalRoot() {
+  web.send(200, "text/html", kPortalPage);
+}
+
+static void redirectToPortalRoot() {
+  web.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
+  web.send(302, "text/plain", "");
+}
+
+static void setupCaptivePortal() {
+  dns.setErrorReplyCode(DNSReplyCode::NoError);
+  dns.start(kDnsPort, "*", WiFi.softAPIP());
+
+  web.on("/", HTTP_GET, handlePortalRoot);
+  web.on("/api/catalog", HTTP_GET, sendCatalogJson);
+  web.on("/manifest.webmanifest", HTTP_GET, sendManifestJson);
+  web.on("/sw.js", HTTP_GET, sendServiceWorkerJs);
+  web.on("/icon.svg", HTTP_GET, sendAppIconSvg);
+  web.on("/api/state", HTTP_GET, sendStateJson);
+  web.on("/api/mode", HTTP_POST, handleApiMode);
+  web.on("/api/toybox/add", HTTP_POST, handleApiToyboxAdd);
+  web.on("/api/toybox/remove", HTTP_POST, handleApiToyboxRemove);
+  web.on("/api/slot/place", HTTP_POST, handleApiSlotPlace);
+  web.on("/api/slot/clear", HTTP_POST, handleApiSlotClear);
+  // Probe URLs used by common client OSes for captive portal detection.
+  web.on("/generate_204", HTTP_GET, redirectToPortalRoot);
+  web.on("/hotspot-detect.html", HTTP_GET, redirectToPortalRoot);
+  web.on("/connecttest.txt", HTTP_GET, redirectToPortalRoot);
+  web.on("/ncsi.txt", HTTP_GET, redirectToPortalRoot);
+  web.on("/fwlink", HTTP_GET, redirectToPortalRoot);
+  web.onNotFound(redirectToPortalRoot);
+  web.begin();
+}
+
+static uint32_t readU32Le(const uint8_t* p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+         ((uint32_t)p[3] << 24);
+}
+
+static void writeU32Le(uint8_t* p, uint32_t v) {
+  p[0] = (uint8_t)(v & 0xff);
+  p[1] = (uint8_t)((v >> 8) & 0xff);
+  p[2] = (uint8_t)((v >> 16) & 0xff);
+  p[3] = (uint8_t)((v >> 24) & 0xff);
+}
+
+static bool isValidPadHello(const lp_frame_t& frame) {
+  if (frame.header.type != LP_MSG_HELLO || frame.header.length < 1) {
+    return false;
+  }
+  if (frame.payload[0] != 0xa1) {
+    return false;
+  }
+
+  // Enrollment request from an uninitialized/reset pad.
+  if (frame.header.length == 1) {
+    return true;
+  }
+
+  if (sharedSecret == 0 || frame.header.length != 5) {
+    return false;
+  }
+
+  const uint32_t incomingSecret = readU32Le(&frame.payload[1]);
+  return incomingSecret == sharedSecret;
+}
+
+static void loadSecret() {
+  prefs.begin("console", true);
+  sharedSecret = prefs.getUInt("secret", 0);
+  prefs.end();
+}
+
+static void saveSecret(uint32_t secret) {
+  prefs.begin("console", false);
+  prefs.putUInt("secret", secret);
+  prefs.end();
+}
+
+static void ensureSecret() {
+  if (sharedSecret != 0) {
+    return;
+  }
+
+  sharedSecret = esp_random();
+  if (sharedSecret == 0) {
+    sharedSecret = 1;
+  }
+  saveSecret(sharedSecret);
+}
+
+static bool sendFrameUart(uint8_t type, const uint8_t* payload, uint8_t payloadLen,
+                          uint8_t forceSeq) {
+  uint8_t wire[sizeof(lp_header_t) + LP_MAX_PAYLOAD + 2];
+  uint16_t wireLen = 0;
+  const uint8_t seq = (forceSeq == 0xff) ? seqCounter++ : forceSeq;
+
+  if (!lp_encode_frame(type, seq, payload, payloadLen, wire, sizeof(wire), &wireLen)) {
+    return false;
+  }
+
+  Serial2.write(wire, wireLen);
+  return true;
+}
+
+static bool sendFrameUdp(uint8_t type, const uint8_t* payload, uint8_t payloadLen,
+                         uint8_t forceSeq) {
+  if (!padKnown || !padPaired) {
+    return false;
+  }
+
+  uint8_t wire[sizeof(lp_header_t) + LP_MAX_PAYLOAD + 2];
+  uint16_t wireLen = 0;
+  const uint8_t seq = (forceSeq == 0xff) ? seqCounter++ : forceSeq;
+
+  if (!lp_encode_frame(type, seq, payload, payloadLen, wire, sizeof(wire), &wireLen)) {
+    return false;
+  }
+
+  udp.beginPacket(padIp, padPort);
+  udp.write(wire, wireLen);
+  return udp.endPacket() == 1;
+}
+
+static void sendAckUart(uint8_t receivedSeq) {
+  const uint8_t payload[1] = {receivedSeq};
+  sendFrameUart(LP_MSG_ACK, payload, sizeof(payload));
+}
+
+static void sendAckUdp(uint8_t receivedSeq) {
+  const uint8_t payload[1] = {receivedSeq};
+  sendFrameUdp(LP_MSG_ACK, payload, sizeof(payload));
+}
+
+static void processUdpIn() {
+  const int packetSize = udp.parsePacket();
+  if (packetSize <= 0) {
+    return;
+  }
+
+  uint8_t inbuf[sizeof(lp_header_t) + LP_MAX_PAYLOAD + 2];
+  const int bytes = udp.read(inbuf, sizeof(inbuf));
+  if (bytes <= 0) {
+    return;
+  }
+
+  lp_frame_t frame;
+  if (!lp_decode_frame(inbuf, (uint16_t)bytes, &frame)) {
+    Serial.println("[console-esp32] dropped bad UDP frame");
+    return;
+  }
+
+  if (!padPaired) {
+    if (!isValidPadHello(frame)) {
+      Serial.println("[console-esp32] unpaired client ignored");
+      return;
+    }
+
+    padIp = udp.remoteIP();
+    padPort = udp.remotePort();
+    padKnown = true;
+    padPaired = true;
+
+    if (frame.header.length == 1) {
+      // Force a new secret on fresh enrollment.
+      sharedSecret = 0;
+    }
+    ensureSecret();
+    uint8_t pairPayload[4];
+    writeU32Le(pairPayload, sharedSecret);
+    sendFrameUdp(LP_MSG_PAIR_SET, pairPayload, sizeof(pairPayload));
+
+    Serial.print("[console-esp32] paired with ");
+    Serial.print(padIp);
+    Serial.print(":");
+    Serial.println(padPort);
+  }
+
+  if (udp.remoteIP() != padIp || udp.remotePort() != padPort) {
+    Serial.println("[console-esp32] packet from non-paired peer dropped");
+    return;
+  }
+
+  if (frame.header.type != LP_MSG_ACK) {
+    sendAckUdp(frame.header.seq);
+  }
+
+  observeFrameState(frame);
+
+  if (frame.header.type == LP_MSG_HELLO || frame.header.type == LP_MSG_PAIR_SET) {
+    return;
+  }
+
+  // Forward all valid frames to RP2040; RP2040 can ignore what it does not use yet.
+  Serial2.write(inbuf, (size_t)bytes);
+}
+
+static void processUartIn() {
+  while (Serial2.available()) {
+    const int c = Serial2.read();
+    if (c < 0) {
+      break;
+    }
+
+    lp_frame_t frame;
+    const lp_parse_result_t res =
+        lp_stream_push(&uartParser, (uint8_t)c, &frame);
+
+    if (res == LP_PARSE_FRAME_BAD_CRC) {
+      Serial.println("[console-esp32] dropped bad UART frame");
+      continue;
+    }
+    if (res != LP_PARSE_FRAME_OK) {
+      continue;
+    }
+
+    if (frame.header.type != LP_MSG_ACK && frame.header.type != LP_MSG_DEBUG) {
+      sendAckUart(frame.header.seq);
+    }
+
+    if (frame.header.type == LP_MSG_DEBUG) {
+      if (kEnableUsbDebugConsole) {
+        // Print RP2040 debug messages to USB serial.
+        char msg[LP_MAX_PAYLOAD + 1];
+        const uint8_t len = frame.header.length < LP_MAX_PAYLOAD ? frame.header.length : LP_MAX_PAYLOAD;
+        memcpy(msg, frame.payload, len);
+        msg[len] = '\0';
+        Serial.print("[lp-debug] ");
+        Serial.println(msg);
+      }
+      continue;
+    }
+
+    observeFrameState(frame);
+
+    // Forward RP2040-originated frames (e.g. LED commands) to pad side.
+    sendFrameUdp(frame.header.type, frame.payload, frame.header.length);
+  }
+}
+
+static void sendHeartbeatToRp2040() {
+  const uint8_t payload[1] = {0xb1};
+  sendFrameUart(LP_MSG_HELLO, payload, sizeof(payload));
+}
+
+static void processPiConsoleBridge() {
+  // ESP USB serial -> Pi UART
+  while (Serial.available()) {
+    const int c = Serial.read();
+    if (c < 0) {
+      break;
+    }
+
+    // Ctrl+] exits bridge mode (common serial escape key).
+    if (c == 0x1d) {
+      piConsoleBridgeMode = false;
+      usbCmdLen = 0;
+      Serial.println("\n[console-esp32] pi-console bridge OFF");
+      return;
+    }
+
+    Serial2.write((uint8_t)c);
+  }
+
+  // Pi UART -> ESP USB serial
+  while (Serial2.available()) {
+    const int c = Serial2.read();
+    if (c < 0) {
+      break;
+    }
+
+    const uint8_t b = (uint8_t)c;
+
+    // 3-state ANSI/VT filter — strips escape sequences, forwards plain text.
+    switch (piAnsiState) {
+      case ANSI_NORMAL:
+        if (b == 0x1b) {
+          piAnsiState = ANSI_AFTER_ESC;
+        } else if (b == '\t' || b == '\n' || b == '\r' || b == 0x08 ||
+                   (b >= 0x20 && b <= 0x7E)) {
+          Serial.write(b);
+        }
+        // else: other C0 controls (e.g. 0x0f, 0x0e charset switches) — discard
+        break;
+
+      case ANSI_AFTER_ESC:
+        if (b == '[') {
+          piAnsiState = ANSI_IN_CSI;  // CSI sequence — consume until 0x40-0x7E
+        } else if (b == ']') {
+          piAnsiState = ANSI_IN_OSC;  // OSC sequence — consume until BEL or ESC\
+        } else {
+          piAnsiState = ANSI_NORMAL;  // 2-char Fe escape, fully consumed
+        }
+        break;
+
+      case ANSI_IN_CSI:
+        // Parameter/intermediate bytes: 0x20-0x3F; final byte: 0x40-0x7E
+        if (b >= 0x40 && b <= 0x7E) {
+          piAnsiState = ANSI_NORMAL;
+        }
+        break;
+
+      case ANSI_IN_OSC:
+        if (b == 0x07) {
+          piAnsiState = ANSI_NORMAL;  // BEL terminates OSC
+        } else if (b == 0x1b) {
+          piAnsiState = ANSI_AFTER_ESC;  // ESC \ (String Terminator) follows
+        }
+        break;
+    }
+  }
+}
+
+static void processUsbConsole() {
+  while (Serial.available()) {
+    const int c = Serial.read();
+    if (c < 0) {
+      break;
+    }
+
+    // Normalize line endings; only parse on '\n'.
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      // Echo newline when not in bridge mode (bridge gets echo from Pi PTY).
+      if (!piConsoleBridgeMode) { Serial.write('\r'); Serial.write('\n'); }
+      usbCmdBuf[usbCmdLen] = '\0';
+      const String cmd(usbCmdBuf);
+      usbCmdLen = 0;
+
+      if (cmd.length() == 0) {
+        continue;
+      }
+
+      if (cmd == "help" || cmd == "?") {
+        Serial.println("[console-esp32] commands: help | pi-console on | pi-console off");
+      } else if (cmd == "pi-console on") {
+        piConsoleBridgeMode = true;
+        Serial.println("[console-esp32] pi-console bridge ON");
+        Serial.println("[console-esp32] Type Ctrl+] to exit bridge mode");
+      } else if (cmd == "pi-console off") {
+        piConsoleBridgeMode = false;
+        Serial.println("[console-esp32] pi-console bridge OFF");
+      } else {
+        Serial.print("[console-esp32] unknown command: ");
+        Serial.println(cmd);
+      }
+
+      continue;
+    }
+
+    if (usbCmdLen < (kUsbCmdMaxLen - 1)) {
+      usbCmdBuf[usbCmdLen++] = (char)c;
+      // Local echo: show typed characters when not in bridge mode (bridge
+      // mode gets echo from the remote PTY instead).
+      if (!piConsoleBridgeMode) {
+        Serial.write((uint8_t)c);
+      }
+    }
+  }
+}
+
+static void setupAccessPoint() {
+  const uint32_t chip = (uint32_t)(ESP.getEfuseMac() & 0x00ffffff);
+  char ssid[32];
+  snprintf(ssid, sizeof(ssid), "ToyPadConsole-%06lX", (unsigned long)chip);
+  apSsid = ssid;
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(apSsid.c_str());
+
+  Serial.print("[console-esp32] AP SSID (open): ");
+  Serial.println(apSsid);
+  Serial.print("[console-esp32] AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  setupCaptivePortal();
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(kRp2040Baud, SERIAL_8N1, 16, 17);
+  lp_stream_init(&uartParser);
+  loadSecret();
+  loadMode();
+
+  Serial.println("[console-esp32] boot");
+  if (kEnableUsbDebugConsole) {
+    Serial.println("[console-esp32] type 'help' for USB console commands");
+  }
+
+  setupAccessPoint();
+
+  udp.begin(kPadListenPort);
+  sendHeartbeatToRp2040();
+}
+
+void loop() {
+  const uint32_t now = millis();
+
+  if (kEnableUsbDebugConsole) {
+    if (piConsoleBridgeMode) {
+      processPiConsoleBridge();
+      dns.processNextRequest();
+      web.handleClient();
+      delay(2);
+      return;
+    }
+
+    processUsbConsole();
+  }
+
+  processUdpIn();
+  processUartIn();
+  dns.processNextRequest();
+  web.handleClient();
+
+  if ((now - lastHelloMs) >= kHelloMs) {
+    lastHelloMs = now;
+    sendHeartbeatToRp2040();
+  }
+
+  if (kEnableUsbDebugConsole && (now - lastDebugHeartbeatMs) >= kDebugHeartbeatMs) {
+    lastDebugHeartbeatMs = now;
+    Serial.print("[console-esp32] alive mode=");
+    Serial.print(runtimeMode == MODE_PASSTHROUGH ? "passthrough" : "emulator");
+    Serial.print(" paired=");
+    Serial.print(padPaired ? "yes" : "no");
+    Serial.print(" ap=");
+    Serial.println(apSsid);
+  }
+
+  delay(2);
+}

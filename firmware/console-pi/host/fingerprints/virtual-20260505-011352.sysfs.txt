@@ -1,0 +1,13 @@
+path=/sys/bus/usb/devices/1-1.4.3
+busnum=1
+devnum=20
+bcdDevice=0210
+bDeviceClass=00
+bDeviceSubClass=00
+bDeviceProtocol=00
+bMaxPacketSize0=64
+manufacturer=PDP LIMITED. 
+product=LEGO READER V2.10
+serial=P.D.P.000000
+speed=12
+version= 2.00
