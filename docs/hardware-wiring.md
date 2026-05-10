@@ -7,7 +7,7 @@ Three physical assemblies need to be wired:
 | Assembly | Boards | Power source |
 |----------|--------|--------------|
 | **Console side** | XIAO RP2040 + Console ESP32 | USB port of PS4 / Xbox 360 |
-| **Pad side** | Pad ESP32 inside physical Toy Pad | Any USB 5 V supply (charger / power bank) |
+| **Pad side** | Lolin ESP32-S2 Mini + physical Toy Pad | Any USB 5 V supply (charger / power bank) |
 
 ---
 
@@ -56,9 +56,67 @@ PS4 front USB ports supply **500 mA** (USB 2.0); Xbox 360 side ports supply
 
 ---
 
-## 2. Pad Side — Physical Toy Pad internals + Pad ESP32
+## 2. Pad Side — ESP32-S2 Mini as USB Host
 
-### 2a. Understanding the Toy Pad PCB
+The ESP32-S2 Mini acts as a USB host to the physical Toy Pad.  
+The Toy Pad stays **completely unmodified** — no soldering on the Toy Pad PCB.
+
+### 2a. Recommended wiring: solder to toypad USB cable
+
+Cut the toypad's USB-A cable about 10 cm from the connector end (or use a
+USB-A breakout board).  Solder the four wires to the S2 Mini as shown below.
+
+```
+Physical Toy Pad  USB cable
+  Red   (VBUS 5V) ─────────────────► 5V  pin on S2 Mini header
+  Black (GND)     ─────────────────► GND pin on S2 Mini header
+  White (D−)      ─────────────────► GPIO 19  (USB D−)
+  Green (D+)      ─────────────────► GPIO 20  (USB D+)
+```
+
+> **Important:** The S2 Mini must be powered from an **external** supply via
+> its 5V/GND header pins (e.g. USB power bank with cable splitter or any 5V
+> regulator).  The USB-C port on the S2 Mini is the same hardware as GPIO 19/20
+> and is occupied by the toypad in host mode — it cannot also supply power to
+> the board.
+
+### 2b. Alternate wiring: USB-C connector
+
+If you do not want to cut the toypad cable, use a USB-A female breakout
+board plugged into a USB-C → USB-A adapter on the S2 Mini.  The S2 Mini
+must still be powered separately via the 5V/GND header pins.
+
+### 2c. Pin reference — S2 Mini ↔ Toy Pad USB
+
+| Signal | ESP32-S2 Mini | Toy Pad USB cable |
+|--------|---------------|-------------------|
+| USB D− | `GPIO 19` (or USB-C D−) | White wire |
+| USB D+ | `GPIO 20` (or USB-C D+) | Green wire |
+| 5 V (to toypad) | `5V` header pin (output) | Red wire |
+| GND | `GND` header pin | Black wire |
+
+> GPIO 19 / GPIO 20 are the ESP32-S2's native USB OTG lines and are the same
+> net as the USB-C connector on the S2 Mini board.
+
+### 2d. Power budget — pad side
+
+| Component | Typical | Peak |
+|-----------|---------|------|
+| ESP32-S2 Mini (WiFi active) | 80 mA | 240 mA |
+| Physical Toy Pad (USB powered) | 80 mA | 160 mA |
+| **Total** | **160 mA** | **400 mA** |
+
+A USB power bank or any 5 V charger at 500 mA is sufficient.
+
+---
+
+## 3. Pad Side (Advanced) — Direct MCU bypass
+
+> This section describes bypassing the Toy Pad's internal MCU and wiring
+> directly to the NFC chip and LED driver.  This is **not required** with the
+> S2 Mini USB host approach above; it is kept for reference.
+
+### 3a. Understanding the Toy Pad PCB
 
 The PS3/PS4 round Toy Pad contains (visible in the PCB photo):
 
@@ -78,7 +136,7 @@ The PS3/PS4 round Toy Pad contains (visible in the PCB photo):
 > - **LPC11U35** — NXP ARM M0 (the original host MCU)
 > - **STM32F042** — ST ARM M0
 
-### 2b. Recommended wiring strategy: bypass the original MCU
+### 3b. Bypass wiring strategy
 
 The cleanest approach is to leave the TRF7970A / PN532 in place, disable or
 remove the original ARM MCU, and connect the Pad ESP32 directly to the NFC
@@ -109,7 +167,7 @@ Physical Toy Pad PCB
    └────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2c. Pin reference — Pad ESP32 ↔ NFC chip
+### 3c. Pin reference — Pad ESP32 ↔ NFC chip
 
 #### If NFC chip is **TRF7970A** (SPI mode)
 
@@ -145,7 +203,7 @@ default when HSU/SPI pads are left floating).
 > SPI.  If you find exactly 4 data traces going from the NFC IC toward the old
 > MCU (MOSI, MISO, SCK, CS) it is SPI.  Two traces with pull-ups suggests I2C.
 
-### 2d. LEDs — WS2812 or custom driver
+### 3d. LEDs — WS2812 or custom driver
 
 The Toy Pad RGB zones are typically driven by a WS2812B-compatible chain or an
 SPI-based LED driver.  
@@ -158,7 +216,7 @@ SPI-based LED driver.
 
 ---
 
-## 3. Power Supply for the Pad Side
+## 4. Power Supply for the Pad Side
 
 Once the physical Toy Pad is modified it no longer plugs into the specific
 console — it just needs **5 V USB power**.  Options, best-first:
@@ -196,7 +254,7 @@ That slightly exceeds a single 500 mA port at full LED brightness.
 
 ---
 
-## 4. Summary — full system wiring
+## 5. Summary — full system wiring
 
 ```
       ┌──── Console USB port A (data+power) ────┐

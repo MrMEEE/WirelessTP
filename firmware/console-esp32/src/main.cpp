@@ -12,6 +12,7 @@
 static const uint16_t kPadListenPort = 25100;
 static const uint32_t kRp2040Baud = 115200;
 static const uint32_t kHelloMs = 3000;
+static const uint32_t kStateSyncMs = 1000;  // full-state broadcast interval
 static const uint16_t kDnsPort = 53;
 static const uint16_t kHttpPort = 80;
 static const uint8_t kSlotCount = 7;
@@ -67,6 +68,7 @@ uint16_t padPort = 0;
 bool padKnown = false;
 bool padPaired = false;
 uint32_t lastHelloMs = 0;
+uint32_t lastStateSyncMs = 0;
 uint32_t lastDebugHeartbeatMs = 0;
 String apSsid;
 uint32_t sharedSecret = 0;
@@ -238,6 +240,16 @@ static const char kPortalPage[] = R"HTML(
     }
     function rgbCss(o, a) {
       return `rgba(${Number(o.r)||0},${Number(o.g)||0},${Number(o.b)||0},${a})`;
+    }
+    // Game sends LED-calibrated PWM values for physical hardware.
+    // Blue LEDs are ~11.6x more efficient per unit than red, green ~2.43x.
+    // Scale channels so the physical white point (244,105,22) maps to (255,255,255).
+    function ledCorrect(o) {
+      return {
+        r: Math.min(255, Math.round((o.r||0) * 1.05)),
+        g: Math.min(255, Math.round((o.g||0) * 2.43)),
+        b: Math.min(255, Math.round((o.b||0) * 11.6))
+      };
     }
     function colorHex(c) { return (Number(c)&0xFF).toString(16).padStart(2,"0"); }
     function rgbHex(o) { return `#${colorHex(o.r)}${colorHex(o.g)}${colorHex(o.b)}`; }
@@ -451,7 +463,7 @@ static const char kPortalPage[] = R"HTML(
         if (!slotNum) return `<div class="slot spacer"></div>`;
         const s = data.slots[slotNum - 1];
         const zone = slotZone(slotNum);
-        const light = data.lights[zone] || { r: 59, g: 70, b: 94 };
+        const light = ledCorrect(data.lights[zone] || { r: 0, g: 0, b: 0 });
         const slotStyle = `background:${rgbCss(light, 0.3)}; border-color:${rgbCss(light, 0.9)};`;
         const clear = s.occupied ? `<button class="clear-slot" data-clear="${slotNum}">x</button>` : "";
         return `<div class="slot ${s.occupied ? "filled" : ""} drop" data-slot="${slotNum}" style="${slotStyle}">S${slotNum}<br>${slotLabel(s)}${clear}</div>`;
@@ -693,6 +705,7 @@ static void observeFrameState(const lp_frame_t& frame) {
     const uint8_t r = frame.payload[1];
     const uint8_t g = frame.payload[2];
     const uint8_t b = frame.payload[3];
+    Serial.printf("[led-rx] z=%u r=%u g=%u b=%u\n", zone, r, g, b);
     if (zone == 0xff) {
       setAllLightZones(r, g, b);
     } else {
@@ -1449,6 +1462,27 @@ void loop() {
   if ((now - lastHelloMs) >= kHelloMs) {
     lastHelloMs = now;
     sendHeartbeatToRp2040();
+  }
+
+  // Periodically re-broadcast full state on both links so peers recover after
+  // a restart without waiting for the next change event.
+  if ((now - lastStateSyncMs) >= kStateSyncMs) {
+    lastStateSyncMs = now;
+    // All 7 slot states → RP2040 via UART; dedup on RP2040 prevents USB spam.
+    for (uint8_t s = 1; s <= kSlotCount; s++) {
+      if (padSlots[s - 1].occupied) {
+        sendTagSet(s, padSlots[s - 1].toyId);
+      } else {
+        sendTagClear(s);
+      }
+    }
+    // All 3 LED zone states → pad-esp32 via UDP so it keeps the toypad lit.
+    if (padKnown && padPaired) {
+      for (uint8_t z = 0; z < kLightZoneCount; z++) {
+        const uint8_t ledPayload[4] = {z, lightZones[z].r, lightZones[z].g, lightZones[z].b};
+        sendFrameUdp(LP_MSG_LED_CMD, ledPayload, sizeof(ledPayload));
+      }
+    }
   }
 
   if (kEnableUsbDebugConsole && (now - lastDebugHeartbeatMs) >= kDebugHeartbeatMs) {

@@ -17,7 +17,7 @@ for arg in "$@"; do
     --upload|-u) UPLOAD=true ;;
     --help|-h)
       echo "Usage: $0 [target-dir] [--upload]"
-      echo "  target-dir  one of: console-rp2040, console-rp2040-ps, console-rp2040-xbox, console-esp32, pad-esp32"
+      echo "  target-dir  one of: console-rp2040, console-rp2040-ps, console-rp2040-xbox, console-esp32, pad-esp32, pad-esp32-nousb"
       exit 0
       ;;
     *) FILTER="$arg" ;;
@@ -42,6 +42,7 @@ TARGETS=(
   "console-rp2040:console_rp2040_xbox360"
   "console-esp32:console_esp32"
   "pad-esp32:pad_esp32"
+  "pad-esp32:pad_esp32_nousb"
 )
 
 FAILED=()

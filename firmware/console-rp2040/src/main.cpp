@@ -17,6 +17,7 @@ static bool sendFrameUart(uint8_t type, const uint8_t* payload, uint8_t payloadL
 
 static const uint32_t kUartBaud = 115200;
 static const uint32_t kHelloMs = 4000;
+static const uint32_t kStateSyncMs = 1000;  // full-state broadcast interval
 static const uint8_t kToyPacketSize = 32;
 static const uint8_t kToyMagicHostToPortal = 0x55;
 static const uint8_t kToyMagicPortalEvent = 0x56;
@@ -339,6 +340,7 @@ static uint8_t toyChecksum(const uint8_t* bytes, uint8_t len) {
 static void sendLedZoneUart(uint8_t zone, uint8_t r, uint8_t g, uint8_t b) {
   const uint8_t payload[4] = {zone, r, g, b};
   sendFrameUart(LP_MSG_LED_CMD, payload, sizeof(payload));
+  debugPrintf("led z=%u r=%u g=%u b=%u", zone, r, g, b);
 }
 
 static void applyPadColor(uint8_t pad, uint8_t r, uint8_t g, uint8_t b) {
@@ -356,13 +358,13 @@ static void applyPadColor(uint8_t pad, uint8_t r, uint8_t g, uint8_t b) {
       setPad(toyState.right);
       sendLedZoneUart(0xff, r, g, b);
       break;
-    case 1:  // pad 1 = left (C0 convention)
-      setPad(toyState.left);
-      sendLedZoneUart(1, r, g, b);
-      break;
-    case 2:  // pad 2 = center (C0 convention)
+    case 1:  // pad 1 = center (C0 convention)
       setPad(toyState.center);
       sendLedZoneUart(0, r, g, b);
+      break;
+    case 2:  // pad 2 = left (C0 convention)
+      setPad(toyState.left);
+      sendLedZoneUart(1, r, g, b);
       break;
     case 3:  // pad 3 = right (C0 convention)
       setPad(toyState.right);
@@ -816,14 +818,14 @@ static void handleToyCommand(const ToyPadOutPacket& p) {
       enqueueToyReply(p.counter, nullptr, 0);
       break;
     case TOY_CMD_C6:
-      // Fade animation for all 3 zones. Order: left, center, right.
+      // Fade animation for all 3 zones. Order: center, left, right.
       // Each zone block is 6 bytes: [effect, duration, count, r, g, b]
       if (p.argsLen >= 18) {
-        sendLedZoneUart(1, p.args[3],  p.args[4],  p.args[5]);   // left
-        sendLedZoneUart(0, p.args[9],  p.args[10], p.args[11]);  // center
+        sendLedZoneUart(0, p.args[3],  p.args[4],  p.args[5]);   // center
+        sendLedZoneUart(1, p.args[9],  p.args[10], p.args[11]);  // left
         sendLedZoneUart(2, p.args[15], p.args[16], p.args[17]);  // right
-        toyState.left.r   = p.args[3];  toyState.left.g   = p.args[4];  toyState.left.b   = p.args[5];
-        toyState.center.r = p.args[9];  toyState.center.g = p.args[10]; toyState.center.b = p.args[11];
+        toyState.center.r = p.args[3];  toyState.center.g = p.args[4];  toyState.center.b = p.args[5];
+        toyState.left.r   = p.args[9];  toyState.left.g   = p.args[10]; toyState.left.b   = p.args[11];
         toyState.right.r  = p.args[15]; toyState.right.g  = p.args[16]; toyState.right.b  = p.args[17];
       }
       enqueueToyReply(p.counter, nullptr, 0);
@@ -832,25 +834,25 @@ static void handleToyCommand(const ToyPadOutPacket& p) {
       // Set all 3 pad colors at once. Order: left, center, right.
       // Each zone block is 4 bytes: [enable, r, g, b]
       if (p.argsLen >= 12) {
-        toyState.left.enable   = (p.args[0] != 0);
-        toyState.left.r        = p.args[1];
-        toyState.left.g        = p.args[2];
-        toyState.left.b        = p.args[3];
+        toyState.center.enable = (p.args[0] != 0);
+        toyState.center.r      = p.args[1];
+        toyState.center.g      = p.args[2];
+        toyState.center.b      = p.args[3];
 
-        toyState.center.enable = (p.args[4] != 0);
-        toyState.center.r      = p.args[5];
-        toyState.center.g      = p.args[6];
-        toyState.center.b      = p.args[7];
+        toyState.left.enable   = (p.args[4] != 0);
+        toyState.left.r        = p.args[5];
+        toyState.left.g        = p.args[6];
+        toyState.left.b        = p.args[7];
 
         toyState.right.enable  = (p.args[8] != 0);
         toyState.right.r       = p.args[9];
         toyState.right.g       = p.args[10];
         toyState.right.b       = p.args[11];
 
-        sendLedZoneUart(1, p.args[1], p.args[2],  p.args[3]);   // left
-        sendLedZoneUart(0, p.args[5], p.args[6],  p.args[7]);   // center
+        sendLedZoneUart(0, p.args[1], p.args[2],  p.args[3]);   // center
+        sendLedZoneUart(1, p.args[5], p.args[6],  p.args[7]);   // left
         sendLedZoneUart(2, p.args[9], p.args[10], p.args[11]);  // right
-        debugPrintf("c8 L=%02x%02x%02x C=%02x%02x%02x R=%02x%02x%02x",
+        debugPrintf("c8 C=%02x%02x%02x L=%02x%02x%02x R=%02x%02x%02x",
           p.args[1],p.args[2],p.args[3], p.args[5],p.args[6],p.args[7],
           p.args[9],p.args[10],p.args[11]);
       }
@@ -1000,14 +1002,16 @@ static void handleFrame(const lp_frame_t& frame) {
         buildToyUidFromToyId(toyId, slot, uid);
 
         if (slot >= 1 && slot <= 7) {
+          const bool sameId = toyState.slotUidValid[slot - 1]
+                             && toyState.slotToyId[slot - 1] == toyId;
           toyState.slotToyId[slot - 1]  = toyId;
           memcpy(toyState.slotUid[slot - 1], uid, kToyUidSize);
           toyState.slotUidValid[slot - 1] = true;
+          if (!sameId) {
+            enqueueToyTagEvent(pad, slot, kToyTagActionPlaced, uid);
+            debugPrintf("TAG_SET slot=%u zone=%u id=%lx", slot, zone, (unsigned long)toyId);
+          }
         }
-
-        enqueueToyTagEvent(pad, slot, kToyTagActionPlaced, uid);
-
-        debugPrintf("TAG_SET slot=%u zone=%u id=%lx", slot, zone, (unsigned long)toyId);
       }
       break;
     case LP_MSG_TAG_CLEAR:
@@ -1016,12 +1020,15 @@ static void handleFrame(const lp_frame_t& frame) {
         const uint8_t zone  = slotToLpZone(slot);
         const uint8_t pad   = lpZoneToToyZone(zone);
         uint8_t uid[kToyUidSize] = {0};
-        if (slot >= 1 && slot <= 7 && toyState.slotUidValid[slot - 1]) {
-          memcpy(uid, toyState.slotUid[slot - 1], kToyUidSize);
-          toyState.slotUidValid[slot - 1] = false;
+        if (slot >= 1 && slot <= 7) {
+          if (toyState.slotUidValid[slot - 1]) {
+            memcpy(uid, toyState.slotUid[slot - 1], kToyUidSize);
+            toyState.slotUidValid[slot - 1] = false;
+            enqueueToyTagEvent(pad, slot, kToyTagActionRemoved, uid);
+            debugPrintf("TAG_CLEAR slot=%u", slot);
+          }
+          // else: already clear — no USB event needed (periodic re-sync dedup)
         }
-        enqueueToyTagEvent(pad, slot, kToyTagActionRemoved, uid);
-        debugPrintf("TAG_CLEAR slot=%u", slot);
       } else {
         // Broadcast clear: remove all occupied slots
         for (uint8_t s = 1; s <= 7; ++s) {
@@ -1146,5 +1153,21 @@ void loop() {
     lastB0StatsLogMs = now;
     debugPrintf("b0 stats rx=%lu q=%lu tx=%lu", (unsigned long)b0ReceivedCount,
                 (unsigned long)b0QueuedCount, (unsigned long)b0SentCount);
+  }
+
+  // Periodically re-broadcast full LED state to console-esp32 so it recovers
+  // the correct zone colours after a restart without waiting for the next game
+  // LED command.
+  static uint32_t lastLedSyncMs = 0;
+  if (toyState.initialized && (now - lastLedSyncMs) >= kStateSyncMs) {
+    lastLedSyncMs = now;
+    const uint8_t ledFrames[3][4] = {
+      {0, toyState.center.r, toyState.center.g, toyState.center.b},
+      {1, toyState.left.r,   toyState.left.g,   toyState.left.b},
+      {2, toyState.right.r,  toyState.right.g,  toyState.right.b},
+    };
+    for (uint8_t z = 0; z < 3; z++) {
+      sendFrameUart(LP_MSG_LED_CMD, ledFrames[z], 4);
+    }
   }
 }
