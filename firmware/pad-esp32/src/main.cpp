@@ -73,6 +73,7 @@ static const uint32_t kBlinkOffMs   = 200;
 static const uint32_t kSearchOnMs   = 400;
 static const uint32_t kSearchOffMs  = 400;
 static const uint32_t kPhysSyncMs   = 8000; // physical zone TAG_SET/TAG_CLEAR re-sync period
+static const uint32_t kLedIdleMs    = 300000; // revert to standby green after 5 min of no LED cmds
 
 #if PAD_USB_HOST
 // Startup B0 command: "55 0f b0 01 (c) LEGO 2014 <checksum>"
@@ -135,6 +136,8 @@ static uint8_t                  sMsgNum     = 1;  // toypad OUT message counter
 static uint32_t sSlotToyId[7]   = {};
 static uint8_t  sSlotUid[7][7]  = {};
 static bool     sSlotOccupied[7]= {};
+// Last D2 outcome — filled by readPhysicalToyId, sent as LP debug in forwardTagEvent.
+static char     sLastD2Status[32] = "d2:init";
 #endif
 
 // ─── WiFi / LP globals ────────────────────────────────────────────────────────
@@ -168,6 +171,7 @@ static uint8_t       sBlinkWhy       = 0;   // 1=kLostMs 2=kPairTimeout triggere
 static uint32_t      sBlinkWhyPeerMs = 0;   // lastPeerMs snapshot when CONN_BLINK_FAIL triggered
 static volatile uint32_t sWifiDrops     = 0;   // WiFi STA_DISCONNECTED event count since last report
 static volatile uint8_t  sWifiDropRsn   = 0;   // reason code from last WiFi drop
+static uint32_t          sLastLedCmdMs  = 0;   // millis() of last LP LED_CMD from game; 0 = never/idle
 
 // ─── Virtual toy state (serial debug menu) ────────────────────────────────────
 // Slots 1-7, index = slot-1.  For USB-host builds slots 1-3 map to physical
@@ -274,7 +278,7 @@ static void sendToypadB1(uint32_t seed, uint32_t conf) {
   plain[6]=(uint8_t)(conf>>8);  plain[7]=(uint8_t)conf;
   uint8_t enc[8]; padTeaEncrypt(plain, enc);
   uint8_t buf[kReportSize] = {};
-  buf[0]=0x55; buf[1]=0x09; buf[2]=0xb1; buf[3]=sMsgNum++;
+  buf[0]=0x55; buf[1]=0x0a; buf[2]=0xb1; buf[3]=sMsgNum++;
   memcpy(&buf[4], enc, 8);
   buf[12] = toypadChecksum(buf, 12);
   sendToToypad(buf);
@@ -287,7 +291,7 @@ static void sendToypadB3(uint32_t conf) {
   plain[2]=(uint8_t)(conf>>8);  plain[3]=(uint8_t)conf;
   uint8_t enc[8]; padTeaEncrypt(plain, enc);
   uint8_t buf[kReportSize] = {};
-  buf[0]=0x55; buf[1]=0x09; buf[2]=0xb3; buf[3]=sMsgNum++;
+  buf[0]=0x55; buf[1]=0x0a; buf[2]=0xb3; buf[3]=sMsgNum++;
   memcpy(&buf[4], enc, 8);
   buf[12] = toypadChecksum(buf, 12);
   sendToToypad(buf);
@@ -327,7 +331,7 @@ static uint32_t padFigScramble(const uint8_t uid[7], uint8_t count) {
   uint8_t buf[24];  // 7 uid + 17 kCharConstant
   memcpy(buf, uid, 7);
   memcpy(buf + 7, kCharConstant, 17);
-  buf[count * 4 - 1] ^= count;
+  buf[count * 4 - 1] = 0xaa;  // Ellerbach: constant overwrite, not XOR
   return padDimRandomize(buf, count);
 }
 
@@ -336,10 +340,11 @@ static void padGenerateFigureKey(const uint8_t uid[7], uint8_t key[16]) {
   const uint32_t s4 = padFigScramble(uid, 4);
   const uint32_t s5 = padFigScramble(uid, 5);
   const uint32_t s6 = padFigScramble(uid, 6);
-  key[0]=(s3>>24); key[1]=(s3>>16); key[2]=(s3>>8);  key[3]=s3;
-  key[4]=(s4>>24); key[5]=(s4>>16); key[6]=(s4>>8);  key[7]=s4;
-  key[8]=(s5>>24); key[9]=(s5>>16); key[10]=(s5>>8); key[11]=s5;
-  key[12]=(s6>>24); key[13]=(s6>>16); key[14]=(s6>>8); key[15]=s6;
+  // Store as little-endian: padTeaDecryptWithKey reads key[n]|(key[n+1]<<8)|...
+  key[0]=(uint8_t)s3; key[1]=(uint8_t)(s3>>8); key[2]=(uint8_t)(s3>>16); key[3]=(uint8_t)(s3>>24);
+  key[4]=(uint8_t)s4; key[5]=(uint8_t)(s4>>8); key[6]=(uint8_t)(s4>>16); key[7]=(uint8_t)(s4>>24);
+  key[8]=(uint8_t)s5; key[9]=(uint8_t)(s5>>8); key[10]=(uint8_t)(s5>>16); key[11]=(uint8_t)(s5>>24);
+  key[12]=(uint8_t)s6; key[13]=(uint8_t)(s6>>8); key[14]=(uint8_t)(s6>>16); key[15]=(uint8_t)(s6>>24);
 }
 
 // TEA decrypt with an arbitrary 16-byte key — inverse of padTeaEncrypt/teaEncryptWithKey.
@@ -361,43 +366,91 @@ static void padTeaDecryptWithKey(const uint8_t* in, uint8_t* out, const uint8_t 
   out[4]=(uint8_t)v1; out[5]=(uint8_t)(v1>>8); out[6]=(uint8_t)(v1>>16); out[7]=(uint8_t)(v1>>24);
 }
 
-// Send D2 (block read) to the physical pad: read 4 pages starting at `page`.
-// Returns the counter byte used, which is stored in sD2WaitCounter by the caller.
-static uint8_t sendToypadD2(uint8_t figIndex, uint8_t page) {
-  const uint8_t ctr = sMsgNum++;
-  uint8_t buf[kReportSize] = {};
-  buf[0]=0x55; buf[1]=0x04; buf[2]=0xD2; buf[3]=ctr;
-  buf[4]=figIndex; buf[5]=page;
-  buf[6] = toypadChecksum(buf, 6);
-  sendToToypad(buf);
-  return ctr;
-}
-
-// Fetch NFC page 36 from the physical pad and decrypt with the per-figure key
-// to get the real LEGO Dimensions character ID.  Blocks up to 80 ms.
-// Returns 0 if the read fails or the decrypted ID is 0.
-static uint32_t readPhysicalToyId(const uint8_t uid[7]) {
+// Fetch NFC pages 36-39 from the physical pad, detect vehicle vs character,
+// and decrypt the character ID with the per-figure key.  Blocks up to ~330 ms.
+// Returns 0 if no figure slot matches the given UID.
+//
+// hintFigIdx: the caller's best guess at which physical reader slot holds this
+// figure (lpZone == padZone-1, so center=0, left=1, right=2).  We try the hint
+// first, then fall back to 0, 1, 2 in order.  TEA id0==id1 validates the match.
+static uint32_t readPhysicalToyId(const uint8_t uid[7], uint8_t hintFigIdx) {
   if (!sUsbDevOpen) return 0;
-  sD2ReplyReady  = false;
-  sD2WaitCounter = sendToypadD2(0, 36);  // figIndex=0, start page 36
-  const uint32_t deadline = millis() + 80;
-  while (!sD2ReplyReady && (millis() < deadline)) {
-    vTaskDelay(pdMS_TO_TICKS(2));
-  }
-  if (!sD2ReplyReady) {
-    sD2WaitCounter = 0;
-    Serial.println("[pad] D2 page36 timeout");
-    return 0;
-  }
-  // sD2PageData[0..7] = pages 36 and 37 (8 bytes, TEA-encrypted with figure key)
+
+  // Pre-compute figure key once — same for all figIdx attempts.
   uint8_t figKey[16];
   padGenerateFigureKey(uid, figKey);
-  uint8_t dec[8];
-  padTeaDecryptWithKey(sD2PageData, dec, figKey);
-  const uint32_t toyId = (uint32_t)dec[0] | ((uint32_t)dec[1]<<8) |
+
+  // Try hint first, then 0, 1, 2 (skipping the hint to avoid duplicates).
+  uint8_t order[4];
+  uint8_t cnt = 0;
+  order[cnt++] = hintFigIdx;
+  for (uint8_t i = 0; i < 3; i++) {
+    if (i != hintFigIdx) order[cnt++] = i;
+  }
+
+  for (uint8_t oi = 0; oi < cnt; oi++) {
+    const uint8_t figIdx = order[oi];
+
+    // Wait for any in-flight OUT transfer (up to 30 ms) before sending D2.
+    const uint32_t busyDeadline = millis() + 30;
+    while (sUsbOutBusy && millis() < busyDeadline) vTaskDelay(pdMS_TO_TICKS(2));
+    if (sUsbOutBusy) {
+      Serial.println("[pad] D2 skip: out busy");
+      strncpy(sLastD2Status, "d2:busy", sizeof(sLastD2Status));
+      return 0;
+    }
+
+    sD2ReplyReady  = false;
+    const uint8_t ctr = sMsgNum++;
+    uint8_t buf[kReportSize] = {};
+    buf[0]=0x55; buf[1]=0x04; buf[2]=0xD2; buf[3]=ctr;
+    buf[4]=figIdx; buf[5]=36;  // figIdx selects reader slot; page 36 = NFC page 0x24
+    buf[6] = toypadChecksum(buf, 6);
+    Serial.printf("[pad] D2 figIdx=%u ctr=%u\n", figIdx, ctr);
+    if (!sendToToypad(buf)) {
+      Serial.println("[pad] D2 send failed");
+      strncpy(sLastD2Status, "d2:sendfail", sizeof(sLastD2Status));
+      return 0;
+    }
+    sD2WaitCounter = ctr;
+
+    const uint32_t deadline = millis() + 80;
+    while (sD2WaitCounter != 0 && !sD2ReplyReady && millis() < deadline) {
+      vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    sD2WaitCounter = 0;
+    if (!sD2ReplyReady) {
+      Serial.printf("[pad] D2 timeout figIdx=%u\n", figIdx);
+      continue;  // try next slot
+    }
+
+    // TEA decrypt pages 36-37 (bytes 0-7).  Valid data has id0 == id1.
+    uint8_t dec[8];
+    padTeaDecryptWithKey(sD2PageData, dec, figKey);
+    const uint32_t id0 = (uint32_t)dec[0] | ((uint32_t)dec[1]<<8) |
                          ((uint32_t)dec[2]<<16) | ((uint32_t)dec[3]<<24);
-  Serial.printf("[pad] D2 ok toyId=0x%04lx\n", (unsigned long)toyId);
-  return toyId;
+    const uint32_t id1 = (uint32_t)dec[4] | ((uint32_t)dec[5]<<8) |
+                         ((uint32_t)dec[6]<<16) | ((uint32_t)dec[7]<<24);
+    Serial.printf("[pad] D2 figIdx=%u id0=0x%04lx id1=0x%04lx%s\n",
+                  figIdx, (unsigned long)id0, (unsigned long)id1,
+                  id0==id1 ? " OK" : " mm");
+    if (id0 != id1) continue;  // wrong reader slot — try next
+
+    // Matched.  Check vehicle marker: page 38 bytes 8-11 == {0x00,0x01,0x00,0x00}.
+    const bool isVehicle = (sD2PageData[8]==0x00 && sD2PageData[9]==0x01 &&
+                            sD2PageData[10]==0x00 && sD2PageData[11]==0x00);
+    if (isVehicle) {
+      Serial.printf("[pad] D2 vehicle id=0x%04lx figIdx=%u\n", (unsigned long)id0, figIdx);
+      snprintf(sLastD2Status, sizeof(sLastD2Status), "d2:veh:%04lx fi=%u", (unsigned long)id0, figIdx);
+    } else {
+      snprintf(sLastD2Status, sizeof(sLastD2Status), "d2:ok:%04lx fi=%u", (unsigned long)id0, figIdx);
+    }
+    return id0;
+  }
+
+  snprintf(sLastD2Status, sizeof(sLastD2Status), "d2:mm");
+  Serial.println("[pad] D2 all figIdx failed");
+  return 0;
 }
 
 #else  // !PAD_USB_HOST — stub LED functions for no-USB builds
@@ -435,16 +488,23 @@ static void usbInCallback(usb_transfer_t* xfer) {
         memcpy(evt.uid, &d[6], 7);
         xQueueSend(sTagQueue, &evt, 0);
       }
-    } else if (d[0] == 0x55 && d[1] == 0x12 && d[3] == 0x00) {
-      // D2 page-read response: [0x55, 0x12, counter, 0x00, <16 bytes NFC data>]
-      const uint8_t ctr = d[2];
-      if (sD2WaitCounter != 0 && ctr == sD2WaitCounter) {
-        memcpy(sD2PageData, &d[4], 16);
-        sD2WaitCounter = 0;   // clear before ready flag (ordering on single-core)
-        sD2ReplyReady  = true;
+    } else if (d[0] == 0x55) {
+      Serial.printf("[usb-in] 0x55 d1=%02x ctr=%02x d3=%02x d4=%02x\n",
+                    d[1], d[2], d[3], d[4]);
+      if (d[1] == 0x12 && d[3] == 0x00) {
+        // D2 success: [0x55, 0x12, counter, 0x00, <16 bytes NFC data>]
+        const uint8_t ctr = d[2];
+        if (sD2WaitCounter != 0 && ctr == sD2WaitCounter) {
+          memcpy(sD2PageData, &d[4], 16);
+          sD2WaitCounter = 0;   // clear before ready flag (single-core ordering)
+          sD2ReplyReady  = true;
+        }
+      } else if (sD2WaitCounter != 0 && d[2] == sD2WaitCounter) {
+        // D2 error response (non-zero status or unexpected length)
+        Serial.printf("[usb-in] D2 err d1=%02x st=%02x\n", d[1], d[3]);
+        sD2WaitCounter = 0;  // break polling loop in readPhysicalToyId
       }
     }
-    // All other 0x55 responses (B0, B1, B3 replies) are silently consumed.
   }
   // Keep polling as long as the device is open.
   if (sUsbDevOpen) {
@@ -453,6 +513,54 @@ static void usbInCallback(usb_transfer_t* xfer) {
 }
 
 // ─── Device open / close ──────────────────────────────────────────────────────
+
+// Auth sequence for the physical toypad.
+// MUST run in its own task, NOT inside usbClientEventCb.
+// Reason: openToypadDevice is called from usbClientEventCb, which itself runs
+// inside usb_host_client_handle_events(). While blocked there, usbOutCallback
+// can never fire (it also needs usb_host_client_handle_events to run), so
+// sUsbOutBusy is never cleared, and every sendToToypad() call after the first
+// is silently dropped. Running auth in a separate task lets vTaskDelay() yield
+// to usbClientTask, which can then process completions between commands.
+static void toypadAuthTask(void* /*arg*/) {
+  Serial.println("[pad-auth] starting auth");
+
+  // Let the USB stack settle after device open.
+  vTaskDelay(pdMS_TO_TICKS(100));
+  if (!sUsbDevOpen) { vTaskDelete(NULL); return; }
+
+  // B0 — wake the pad
+  while (sUsbOutBusy) vTaskDelay(pdMS_TO_TICKS(2));
+  sendToToypad(kToypadB0Cmd);
+  for (int i = 0; i < 100 && sUsbOutBusy; i++) vTaskDelay(pdMS_TO_TICKS(2));
+  vTaskDelay(pdMS_TO_TICKS(50));
+  if (!sUsbDevOpen) { vTaskDelete(NULL); return; }
+
+  // B1 — seed. Generate conf here; B3 MUST use the same conf.
+  const uint32_t seed = esp_random();
+  const uint32_t conf = esp_random();
+  sendToypadB1(seed, conf);
+  for (int i = 0; i < 100 && sUsbOutBusy; i++) vTaskDelay(pdMS_TO_TICKS(2));
+  vTaskDelay(pdMS_TO_TICKS(50));
+  if (!sUsbDevOpen) { vTaskDelete(NULL); return; }
+
+  // B3 — challenge; conf must match the one sent in B1
+  sendToypadB3(conf);
+  for (int i = 0; i < 100 && sUsbOutBusy; i++) vTaskDelay(pdMS_TO_TICKS(2));
+  vTaskDelay(pdMS_TO_TICKS(100));  // wait for pad's B3 response to arrive
+  if (!sUsbDevOpen) { vTaskDelete(NULL); return; }
+
+  Serial.println("[pad-usb] toypad auth complete");
+
+  // Restore standby green if we were already paired (USB reconnect case).
+  if (connState == CONN_PAIRED) {
+    while (sUsbOutBusy) vTaskDelay(pdMS_TO_TICKS(2));
+    toypadLedAll(kGR, kGG, kGB);
+  }
+
+  vTaskDelete(NULL);
+}
+
 static void openToypadDevice(uint8_t devAddr) {
   if (usb_host_device_open(sUsbClient, devAddr, &sUsbDev) != ESP_OK) {
     Serial.println("[pad-usb] device open failed");
@@ -509,32 +617,20 @@ static void openToypadDevice(uint8_t devAddr) {
 
   sUsbDevOpen = true;
   sUsbOpenOk   = 1;
-  usb_host_transfer_submit(sUsbInXfer);  // begin polling
+  sUsbOutBusy  = false;  // safety reset before auth
+  usb_host_transfer_submit(sUsbInXfer);  // begin IN polling
 
-  // Initialise: B0 wake command, then B1×2 + B3 auth so the pad accepts LEDs.
-  vTaskDelay(pdMS_TO_TICKS(50));
-  sendToToypad(kToypadB0Cmd);
-  vTaskDelay(pdMS_TO_TICKS(20));
-  sendToypadB1(esp_random(), esp_random());  // seed 1
-  vTaskDelay(pdMS_TO_TICKS(20));
-  sendToypadB1(esp_random(), esp_random());  // seed 2
-  vTaskDelay(pdMS_TO_TICKS(20));
-  sendToypadB3(esp_random());                // challenge
-  vTaskDelay(pdMS_TO_TICKS(20));
-  Serial.println("[pad-usb] toypad ready");
-
-  // If already paired, restore standby green (covers USB reconnect after pairing).
-  if (connState == CONN_PAIRED) {
-    vTaskDelay(pdMS_TO_TICKS(20));
-    toypadLedAll(kGR, kGG, kGB);
-  }
+  // Auth runs in a dedicated task — see toypadAuthTask comment above.
+  xTaskCreate(toypadAuthTask, "pad-auth", 3072, NULL, 5, NULL);
 }
 
 static void closeToypadDevice() {
-  sUsbDevOpen = false;
-  sUsbOutBusy = false;
+  sUsbDevOpen    = false;
+  sUsbOutBusy    = false;
+  sD2WaitCounter = 0;      // abort any pending D2 read
+  sD2ReplyReady  = false;
   // Give in-flight transfers a moment to complete with error status before freeing.
-  vTaskDelay(pdMS_TO_TICKS(20));
+  vTaskDelay(pdMS_TO_TICKS(50));  // increased: 20ms was too short for in-flight xfers
   if (sUsbInXfer)  { usb_host_transfer_free(sUsbInXfer);  sUsbInXfer  = NULL; }
   if (sUsbOutXfer) { usb_host_transfer_free(sUsbOutXfer); sUsbOutXfer = NULL; }
   if (sUsbDev) {
@@ -715,7 +811,7 @@ static void forwardTagEvent(const TagEvent& evt) {
       return;
     }
     // Read real LEGO character ID from NFC page 36 of the physical figure.
-    uint32_t toyId = readPhysicalToyId(evt.uid);
+    uint32_t toyId = readPhysicalToyId(evt.uid, evt.lpZone);
     if (toyId == 0) {
       // Fallback: UID bytes — game won’t recognise the toy but at least shows it.
       toyId = (uint32_t)evt.uid[0] | ((uint32_t)evt.uid[1]<<8) |
@@ -734,6 +830,8 @@ static void forwardTagEvent(const TagEvent& evt) {
     payload[0]=slot; payload[1]=(uint8_t)toyId; payload[2]=(uint8_t)(toyId>>8);
     payload[3]=(uint8_t)(toyId>>16); payload[4]=(uint8_t)(toyId>>24);
     sendFrame(LP_MSG_TAG_SET, payload, 5, true);
+    // Report D2 outcome over LP debug so it appears in console output.
+    sendFrame(LP_MSG_DEBUG, (const uint8_t*)sLastD2Status, strlen(sLastD2Status), false);
   } else {
     // Find the slot holding this UID in this zone.
     uint8_t slot = 0;
@@ -841,60 +939,103 @@ static const char kPadPortalPage[] = R"HTML(
   <meta name="theme-color" content="#101827">
   <title>Toy Pad Bridge</title>
   <style>
-    :root { --bg:#111827; --panel:#1f2937; --muted:#93a0ba; --ink:#e5e7eb; --accent:#4f46e5; }
-    * { box-sizing: border-box; }
-    body { margin:0; background:linear-gradient(170deg,#101827,#1b2a40); color:var(--ink); font-family:"Trebuchet MS","Segoe UI",sans-serif; }
-    .app { max-width:640px; margin:0 auto; padding:14px; display:grid; gap:10px; }
-    .card { background:rgba(25,34,52,.88); border:1px solid rgba(255,255,255,.14); border-radius:12px; padding:16px; }
-    .badge { background:#273552; border:1px solid rgba(255,255,255,.2); border-radius:999px; padding:5px 10px; font-size:.84rem; display:inline-block; margin:4px 4px 4px 0; }
-    .status-row { display:flex; flex-wrap:wrap; gap:4px; }
-    h2 { margin:0 0 4px; font-size:1.1rem; }
-    .muted { color:var(--muted); font-size:.85rem; }
-    .hint { background:rgba(79,70,229,.15); border:1px solid rgba(79,70,229,.4); border-radius:8px; padding:10px 14px; font-size:.88rem; color:#a5b4fc; }
-    code { background:#1a2540; border-radius:4px; padding:1px 5px; font-size:.85rem; }
+    :root{--muted:#93a0ba;--ink:#e5e7eb;}
+    *{box-sizing:border-box;}
+    body{margin:0;background:linear-gradient(170deg,#101827,#1b2a40);color:var(--ink);font-family:"Trebuchet MS","Segoe UI",sans-serif;}
+    .app{max-width:640px;margin:0 auto;padding:14px;display:grid;gap:10px;}
+    .card{background:rgba(25,34,52,.88);border:1px solid rgba(255,255,255,.14);border-radius:12px;padding:16px;}
+    .badge{background:#273552;border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:4px 10px;font-size:.84rem;display:inline-block;margin:3px 3px 3px 0;}
+    .ok {background:rgba(22,163,74,.2);border-color:rgba(22,163,74,.4);color:#4ade80;}
+    .warn{background:rgba(161,98,7,.2);border-color:rgba(161,98,7,.4);color:#fbbf24;}
+    .err {background:rgba(185,28,28,.2);border-color:rgba(185,28,28,.4);color:#f87171;}
+    h3{margin:0 0 10px;font-size:1rem;}
+    .muted{color:var(--muted);font-size:.85rem;}
+    .toy{padding:8px 0;border-bottom:1px solid rgba(255,255,255,.07);display:flex;gap:10px;align-items:flex-start;}
+    .toy:last-child{border-bottom:none;}
+    .toy-zone{font-size:.74rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;min-width:46px;padding-top:2px;}
+    .toy-name{font-weight:600;font-size:.95rem;}
+    .toy-world{font-size:.8rem;color:var(--muted);}
+    .empty{color:var(--muted);font-style:italic;font-size:.88rem;}
+    code{background:#1a2540;border-radius:4px;padding:1px 5px;font-size:.85rem;}
   </style>
 </head>
 <body>
   <div class="app">
     <div class="card">
-      <h2>Toy Pad Bridge</h2>
-      <div class="muted" id="subtitle">Loading...</div>
+      <h3>Toy Pad Bridge</h3>
+      <div class="muted" id="sub">Loading...</div>
     </div>
     <div class="card">
-      <h3 style="margin-top:0">Status</h3>
-      <div class="status-row" id="statusRow"></div>
-    </div>
-    <div class="card hint">
-      Debug actions are available over the USB serial port.<br>
-      Connect via a terminal at 115200 baud and press any key to open the menu.<br>
-      Commands: <code>s</code> state &nbsp; <code>p &lt;slot&gt;</code> place &nbsp; <code>r &lt;slot&gt;</code> remove &nbsp; <code>f &lt;text&gt;</code> search
+      <h3>Status</h3>
+      <div id="status"></div>
     </div>
     <div class="card">
-      <h3 style="margin-top:0">WiFi</h3>
-      <div id="wifiStatus" class="muted">Loading...</div>
+      <h3>Toys on Pad</h3>
+      <div id="toys"><div class="empty">No toys detected</div></div>
+    </div>
+    <div class="card">
+      <h3>WiFi</h3>
+      <div id="wifi" class="muted">Loading...</div>
+    </div>
+    <div class="card muted" style="font-size:.82rem">
+      Debug via USB serial at 115200 baud &mdash; press any key for menu.<br>
+      <code>s</code>&nbsp;state &nbsp;<code>p N</code>&nbsp;place &nbsp;<code>r N</code>&nbsp;remove &nbsp;<code>f text</code>&nbsp;search
     </div>
   </div>
   <script>
-    async function refresh() {
-      try {
-        const r = await fetch('/api/state', { cache:'no-store' });
-        const d = await r.json();
-        document.getElementById('subtitle').textContent = d.consoleIp ? ('Connected to ' + d.consoleIp) : 'Searching for console...';
-        document.getElementById('statusRow').innerHTML = [
-          '<span class="badge">State: ' + d.state + '</span>',
-          '<span class="badge">Console: ' + (d.consoleIp || '-') + '</span>',
-          '<span class="badge">Secret: ' + (d.hasSecret ? 'yes' : 'no') + '</span>',
-          '<span class="badge">WiFi: ' + d.ssid + '</span>',
-        ].join('');
-        document.getElementById('wifiStatus').textContent = 'SSID: ' + d.ssid + ' | IP: ' + d.ip;
-      } catch (e) { document.getElementById('subtitle').textContent = 'Error: ' + e.message; }
+    var catalog=null;
+    var ZONE=['Center','Left','Right'];
+    function badge(txt,cls){return '<span class="badge'+(cls?' '+cls:'')+'">'+txt+'</span>';}
+    async function loadCatalog(){
+      if(catalog)return;
+      try{
+        var r=await fetch('/api/catalog',{cache:'force-cache'});
+        var arr=await r.json();
+        catalog={};
+        arr.forEach(function(t){catalog[t.id]=t;});
+      }catch(e){catalog={};}
+    }
+    function toyInfo(id){
+      if(!catalog)return{name:'Toy '+id,world:'',type:'character'};
+      return catalog[id]||{name:'Toy '+id,world:'',type:'character'};
+    }
+    async function refresh(){
+      await loadCatalog();
+      try{
+        var r=await fetch('/api/state',{cache:'no-store'});
+        var d=await r.json();
+        document.getElementById('sub').textContent=
+          d.consoleIp?'Paired with console at '+d.consoleIp:'Searching for console\u2026';
+        var stCls=d.state==='paired'?'ok':d.state==='fail'?'err':'warn';
+        document.getElementById('status').innerHTML=
+          badge('Bridge: '+d.state,stCls)+
+          badge('Game: '+(d.gameActive?'active':'idle'),d.gameActive?'ok':'warn')+
+          badge('Console: '+(d.consoleIp||'\u2014'),d.consoleIp?'ok':'');
+        var slots=d.slots||[];
+        if(slots.length===0){
+          document.getElementById('toys').innerHTML='<div class="empty">No toys on pad</div>';
+        }else{
+          document.getElementById('toys').innerHTML=slots.map(function(s){
+            var t=toyInfo(s.toyId);
+            return '<div class="toy"><span class="toy-zone">'+(ZONE[s.zone]||'?')+'</span>'
+              +'<span><div class="toy-name">'+t.name+'</div>'
+              +(t.world?'<div class="toy-world">'+t.world+'</div>':'')
+              +'</span></div>';
+          }).join('');
+        }
+        document.getElementById('wifi').textContent='SSID: '+d.ssid+' | IP: '+d.ip;
+      }catch(e){document.getElementById('sub').textContent='Error: '+e.message;}
     }
     refresh();
-    setInterval(refresh, 2000);
+    setInterval(refresh,2000);
   </script>
 </body>
 </html>
 )HTML";
+
+static void handlePadCatalog() {
+  web.send(200, "application/json", kLdCatalogJson);
+}
 
 static void handlePadRoot() {
   web.send(200, "text/html", kPadPortalPage);
@@ -920,6 +1061,31 @@ static void handlePadState() {
   json += "\",\"ip\":\"";
   json += WiFi.localIP().toString();
   json += "\"";
+  // Game active: LP LED_CMD received within the last 30 s.
+  const uint32_t msNow = millis();
+  json += ",\"gameActive\":";
+  json += (sLastLedCmdMs != 0 && (msNow - sLastLedCmdMs) < kLedIdleMs) ? "true" : "false";
+  // Current slot occupancy (USB-host builds only).
+#if PAD_USB_HOST
+  json += ",\"slots\":[";
+  static const uint8_t kSltZone[7] = {1,0,2,1,1,2,2};  // slot1..7 → lpZone 0-2
+  bool firstSlot = true;
+  for (uint8_t si = 0; si < 7; si++) {
+    if (!sSlotOccupied[si]) continue;
+    if (!firstSlot) json += ",";
+    json += "{\"slot\":";
+    json += (uint32_t)(si + 1);
+    json += ",\"zone\":";
+    json += (uint32_t)kSltZone[si];
+    json += ",\"toyId\":";
+    json += sSlotToyId[si];
+    json += "}";
+    firstSlot = false;
+  }
+  json += "]";
+#else
+  json += ",\"slots\":[]";
+#endif
   json += "}";
   web.send(200, "application/json", json);
 }
@@ -1313,8 +1479,9 @@ static void serviceSerialMenu() {
 
 // ─── STA web server ───────────────────────────────────────────────────────────
 static void startPadWeb() {
-  web.on("/",          HTTP_GET, handlePadRoot);
-  web.on("/api/state", HTTP_GET, handlePadState);
+  web.on("/",            HTTP_GET, handlePadRoot);
+  web.on("/api/state",   HTTP_GET, handlePadState);
+  web.on("/api/catalog", HTTP_GET, handlePadCatalog);
   web.begin();
 }
 
@@ -1399,6 +1566,7 @@ static void processTcpIn(uint32_t now) {
       const uint8_t r    = frame.payload[1];
       const uint8_t g    = frame.payload[2];
       const uint8_t b    = frame.payload[3];
+      sLastLedCmdMs = millis();  // game is active
       if (zone == 0xff) {
         toypadLedAll(r, g, b);
       } else {
@@ -1562,6 +1730,28 @@ void loop() {
         helloStartMs = now;
         connState  = CONN_BLINK_FAIL;
         startBlink(kBlinkCount);
+      }
+      // Standby green: hold the physical pad green while no game is active.
+      // When the game goes quiet for kLedIdleMs, revert to green.
+      // Refresh every 5 s while idle so a power-cycled pad recovers automatically.
+      {
+        const bool gameIdle = (sLastLedCmdMs == 0 ||
+                               (now - sLastLedCmdMs) >= kLedIdleMs);
+        if (gameIdle && sLastLedCmdMs != 0) {
+          sLastLedCmdMs = 0;  // transition: game gone quiet
+        }
+        static uint32_t sStandbyRefreshMs = 0;
+        if (gameIdle) {
+#if PAD_USB_HOST
+          if (sUsbDevOpen &&
+              (sStandbyRefreshMs == 0 || (now - sStandbyRefreshMs) >= 5000u)) {
+            sStandbyRefreshMs = now;
+            toypadLedAll(kGR, kGG, kGB);
+          }
+#endif
+        } else {
+          sStandbyRefreshMs = 0;  // reset so refresh fires immediately on next idle
+        }
       }
 #if PAD_USB_HOST
       // Drain physical tag event queue

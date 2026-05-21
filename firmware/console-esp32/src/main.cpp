@@ -82,6 +82,7 @@ String apSsid;
 uint32_t sharedSecret = 0;
 RuntimeMode runtimeMode = MODE_EMULATOR;
 bool ledStateKnown = false;  // true once RP2040 has sent at least one LED_CMD
+uint32_t sLastLedCmdFromRp2040Ms = 0;  // millis() of last LED_CMD from RP2040; 0=never
 LedZoneState lightZones[kLightZoneCount] = {};
 SlotState padSlots[kSlotCount] = {};
 ToyboxEntry toybox[kToyboxLimit] = {};
@@ -458,6 +459,7 @@ static const char kPortalPage[] = R"HTML(
         `<span class="badge">Pad ${data.paired ? "Paired" : "Waiting"}</span>`,
         `<span class="badge">Endpoint: ${data.paired ? data.padEndpoint : "-"}</span>`,
         `<span class="badge">Secret: ${data.hasSecret ? "yes" : "no"}</span>`,
+        `<span class="badge ${data.gameActive ? "ok" : ""}">Game: ${data.gameActive ? "Active" : "Idle"}</span>`,
         `<span class="badge">Touch: tap toy then slot</span>`
       ].join("");
       document.getElementById("toybox").innerHTML = data.toybox.map((t) => `<button class="token ${t.type}" data-index="${t.index}"><span class="token-remove" data-remove-idx="${t.index}" title="Remove from toybox">×</span>${t.label}<br>0x${Number(t.toyId).toString(16).toUpperCase()}</button>`).join("") || `<div style="color:var(--muted)">Toy box is empty.</div>`;
@@ -708,6 +710,34 @@ static void setAllLightZones(uint8_t r, uint8_t g, uint8_t b) {
   }
 }
 
+// Search kLdCatalogJson for a toy by numeric ID; fills nameBuf and *typeOut.
+static bool catalogLookupById(uint32_t toyId, char* nameBuf, size_t nameBufLen, uint8_t* typeOut) {
+  const char* p = kLdCatalogJson;
+  while (true) {
+    const char* idTag = strstr(p, "\"id\":");
+    if (!idTag) break;
+    p = idTag + 5;
+    uint32_t id = 0;
+    const char* q = p;
+    while (*q >= '0' && *q <= '9') { id = id * 10 + (uint32_t)(*q++ - '0'); }
+    if (id == toyId && (*q < '0' || *q > '9')) {
+      const char* nt = strstr(q, "\"name\":\"");
+      if (!nt) break;
+      const char* ns = nt + 8;
+      size_t nl = 0;
+      while (ns[nl] && ns[nl] != '"' && nl < nameBufLen - 1) { nameBuf[nl] = ns[nl]; nl++; }
+      nameBuf[nl] = '\0';
+      if (typeOut) {
+        const char* tt = strstr(q, "\"type\":\"");
+        *typeOut = (tt && strncmp(tt + 8, "vehicle", 7) == 0) ? TOY_VEHICLE : TOY_CHARACTER;
+      }
+      return true;
+    }
+    p = q;
+  }
+  return false;
+}
+
 static void observeFrameState(const lp_frame_t& frame) {
   if (frame.header.type == LP_MSG_LED_CMD && frame.header.length >= 4) {
     const uint8_t zone = frame.payload[0];
@@ -728,7 +758,12 @@ static void observeFrameState(const lp_frame_t& frame) {
     const uint8_t slotNum = frame.payload[0];
     if (slotNum >= 1 && slotNum <= kSlotCount) {
       const uint32_t toyId = readU32Le(&frame.payload[1]);
-      setSlotState(slotNum - 1, toyId, NULL, TOY_UNKNOWN);
+      char name[24] = {};
+      uint8_t toyType = TOY_UNKNOWN;
+      if (!catalogLookupById(toyId, name, sizeof(name), &toyType)) {
+        snprintf(name, sizeof(name), "Toy %lu", (unsigned long)toyId);
+      }
+      setSlotState(slotNum - 1, toyId, name, toyType);
     }
     return;
   }
@@ -920,6 +955,12 @@ static void sendStateJson() {
     json += "}";
   }
   json += "]";
+  json += ",\"gameActive\":";
+  {
+    const uint32_t msNow = millis();
+    json += ((sLastLedCmdFromRp2040Ms != 0) && (msNow - sLastLedCmdFromRp2040Ms) < 30000u)
+                ? "true" : "false";
+  }
   json += "}";
 
   web.send(200, "application/json", json);
@@ -1361,6 +1402,7 @@ static void processUartIn() {
     // Only forward LED commands to the pad. Tag events flow console→RP2040,
     // not the reverse; forwarding HELLOs/ACKs/etc. confuses the pad's LP state.
     if (frame.header.type == LP_MSG_LED_CMD) {
+      sLastLedCmdFromRp2040Ms = millis();
       sendFrameTcp(frame.header.type, frame.payload, frame.header.length);
     }
   }
@@ -1581,9 +1623,12 @@ void loop() {
       }
     }
     // All 3 LED zone states → pad-esp32 so it keeps the toypad lit.
-    // Only send once RP2040 has provided real LED state; sending (0,0,0) before
-    // that would race with and extinguish the pad's pairing blink animation.
-    if (padKnown && padPaired && ledStateKnown) {
+    // Only send while the game is active (RP2040 LED_CMD seen within last 30 s).
+    // When the game goes quiet the pad auto-reverts to standby green via its
+    // own 30 s timeout without us pushing stale game colours at it.
+    const bool gameNowActive = (sLastLedCmdFromRp2040Ms != 0) &&
+                               (now - sLastLedCmdFromRp2040Ms) < 30000u;
+    if (padKnown && padPaired && ledStateKnown && gameNowActive) {
       for (uint8_t z = 0; z < kLightZoneCount; z++) {
         const uint8_t ledPayload[4] = {z, lightZones[z].r, lightZones[z].g, lightZones[z].b};
         sendFrameTcp(LP_MSG_LED_CMD, ledPayload, sizeof(ledPayload));
