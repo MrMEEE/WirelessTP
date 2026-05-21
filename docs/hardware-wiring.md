@@ -61,42 +61,59 @@ PS4 front USB ports supply **500 mA** (USB 2.0); Xbox 360 side ports supply
 The ESP32-S2 Mini acts as a USB host to the physical Toy Pad.  
 The Toy Pad stays **completely unmodified** — no soldering on the Toy Pad PCB.
 
-### 2a. Recommended wiring: solder to toypad USB cable
+### 2a. Recommended wiring: USB-A female → USB-C adapter (no soldering)
 
-Cut the toypad's USB-A cable about 10 cm from the connector end (or use a
-USB-A breakout board).  Solder the four wires to the S2 Mini as shown below.
+Use a **USB-A female to USB-C adapter** (or a short USB-A female ↔ USB-C
+cable) to connect the toypad's intact USB cable to the S2 Mini's USB-C port.
+Power the S2 Mini via its **VBUS + GND header pins** from an external 5 V
+supply (power bank, charger, etc.).
+
+```
+Physical Toy Pad
+  USB-A plug ──► USB-A female ↔ USB-C adapter ──► USB-C port on S2 Mini
+                                                         (D− / D+ / VBUS)
+External 5 V supply ─────────────────────────────► VBUS header pin on S2 Mini
+                    ─────────────────────────────► GND  header pin on S2 Mini
+```
+
+> **Why VBUS header pin?**  GPIO 19 (D−) and GPIO 20 (D+) are the ESP32-S2's
+> USB OTG lines and are **only** accessible via the USB-C connector — they are
+> **not** broken out as solder pads on the header.  The USB-C port is therefore
+> used for the toypad data connection.  5 V fed into the `VBUS` header pin
+> powers the board and also flows through to the USB-C VBUS, supplying the
+> toypad.
+
+### 2b. Alternate wiring: cut cable + USB-C breakout board
+
+If you prefer a permanent direct-wired connection, cut the toypad's USB-A
+cable and connect the four wires to a **USB-C breakout board**, then plug
+the breakout into the S2 Mini's USB-C port.  The S2 Mini still needs
+external power via the VBUS + GND header pins.
 
 ```
 Physical Toy Pad  USB cable
-  Red   (VBUS 5V) ─────────────────► 5V  pin on S2 Mini header
-  Black (GND)     ─────────────────► GND pin on S2 Mini header
-  White (D−)      ─────────────────► GPIO 19  (USB D−)
-  Green (D+)      ─────────────────► GPIO 20  (USB D+)
+  Red   (VBUS 5V) ─────────────────► USB-C breakout VBUS
+  Black (GND)     ─────────────────► USB-C breakout GND
+  White (D−)      ─────────────────► USB-C breakout D−
+  Green (D+)      ─────────────────► USB-C breakout D+
+                             USB-C breakout ──► S2 Mini USB-C port
+
+External 5 V supply ─────────────────────────► VBUS header pin on S2 Mini
+                    ─────────────────────────► GND  header pin on S2 Mini
 ```
-
-> **Important:** The S2 Mini must be powered from an **external** supply via
-> its 5V/GND header pins (e.g. USB power bank with cable splitter or any 5V
-> regulator).  The USB-C port on the S2 Mini is the same hardware as GPIO 19/20
-> and is occupied by the toypad in host mode — it cannot also supply power to
-> the board.
-
-### 2b. Alternate wiring: USB-C connector
-
-If you do not want to cut the toypad cable, use a USB-A female breakout
-board plugged into a USB-C → USB-A adapter on the S2 Mini.  The S2 Mini
-must still be powered separately via the 5V/GND header pins.
 
 ### 2c. Pin reference — S2 Mini ↔ Toy Pad USB
 
 | Signal | ESP32-S2 Mini | Toy Pad USB cable |
 |--------|---------------|-------------------|
-| USB D− | `GPIO 19` (or USB-C D−) | White wire |
-| USB D+ | `GPIO 20` (or USB-C D+) | Green wire |
-| 5 V (to toypad) | `5V` header pin (output) | Red wire |
+| USB D− | USB-C connector D− (internal GPIO 19) | White wire |
+| USB D+ | USB-C connector D+ (internal GPIO 20) | Green wire |
+| 5 V (to toypad) | `VBUS` header pin → USB-C VBUS | Red wire |
 | GND | `GND` header pin | Black wire |
 
-> GPIO 19 / GPIO 20 are the ESP32-S2's native USB OTG lines and are the same
-> net as the USB-C connector on the S2 Mini board.
+> GPIO 19 / GPIO 20 are the ESP32-S2's native USB OTG lines.  On the S2 Mini
+> they are wired directly to the USB-C connector and are **not** exposed as
+> header pins — the USB-C port is the only way to access them.
 
 ### 2d. Power budget — pad side
 

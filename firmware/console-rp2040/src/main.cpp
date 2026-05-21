@@ -657,7 +657,12 @@ static void serviceToyInQueue() {
   // the endpoint is busy or not yet ready.
   static bool loggedFirstAttempt = false;
   while (toyInQueue.count > 0) {
-    if (!TinyUSBDevice.mounted()) break;
+    if (!TinyUSBDevice.mounted()) {
+      // No USB host connected — discard stale events to prevent overflow.
+      // The host will receive fresh events via state-sync when it connects.
+      memset(&toyInQueue, 0, sizeof(toyInQueue));
+      break;
+    }
     uint8_t packet[kToyUsbReportSize];
     if (!peekToyInPacket(packet)) break;
     // One-shot diagnostic: capture pre-send state, then log with the result.

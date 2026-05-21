@@ -3,9 +3,11 @@
 #include <Preferences.h>
 #include <ctype.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
+#include <WiFiClient.h>
+#include <WiFiServer.h>
 #include <WebServer.h>
 
+#include <lwip/sockets.h>  // for direct ::send() — bypasses WiFiClient::_connected stale-errno
 #include "link_protocol.h"
 #include "ld_catalog_data.h"
 
@@ -13,6 +15,10 @@ static const uint16_t kPadListenPort = 25100;
 static const uint32_t kRp2040Baud = 115200;
 static const uint32_t kHelloMs = 3000;
 static const uint32_t kStateSyncMs = 1000;  // full-state broadcast interval
+// If no LP frame arrives from the pad within this window, declare it disconnected.
+// The pad sends pad-dbg every 1 s and HELLO heartbeat every 5 s, so 8 s gives ample
+// margin while still recovering well within any human-perceptible timeout.
+static const uint32_t kPadRxTimeoutMs = 8000;
 static const uint16_t kDnsPort = 53;
 static const uint16_t kHttpPort = 80;
 static const uint8_t kSlotCount = 7;
@@ -57,22 +63,25 @@ enum ToyType : uint8_t {
   TOY_VEHICLE = 2,
 };
 
-WiFiUDP udp;
+WiFiServer tcpServer(kPadListenPort);
+WiFiClient padClient;
+lp_stream_parser_t tcpParser;
 DNSServer dns;
 WebServer web(kHttpPort);
 Preferences prefs;
 uint8_t seqCounter = 0;
 lp_stream_parser_t uartParser;
 IPAddress padIp;
-uint16_t padPort = 0;
-bool padKnown = false;
-bool padPaired = false;
+bool     padKnown    = false;
+bool     padPaired   = false;
+uint32_t padLastRxMs = 0;  // millis() of last successfully-parsed LP frame from pad
 uint32_t lastHelloMs = 0;
 uint32_t lastStateSyncMs = 0;
 uint32_t lastDebugHeartbeatMs = 0;
 String apSsid;
 uint32_t sharedSecret = 0;
 RuntimeMode runtimeMode = MODE_EMULATOR;
+bool ledStateKnown = false;  // true once RP2040 has sent at least one LED_CMD
 LedZoneState lightZones[kLightZoneCount] = {};
 SlotState padSlots[kSlotCount] = {};
 ToyboxEntry toybox[kToyboxLimit] = {};
@@ -95,7 +104,7 @@ static uint32_t readU32Le(const uint8_t* p);
 static void writeU32Le(uint8_t* p, uint32_t v);
 static bool sendFrameUart(uint8_t type, const uint8_t* payload, uint8_t payloadLen,
                           uint8_t forceSeq = 0xff);
-static bool sendFrameUdp(uint8_t type, const uint8_t* payload, uint8_t payloadLen,
+static bool sendFrameTcp(uint8_t type, const uint8_t* payload, uint8_t payloadLen,
                          uint8_t forceSeq = 0xff);
 
 static const char* toyTypeToString(uint8_t toyType);
@@ -706,6 +715,7 @@ static void observeFrameState(const lp_frame_t& frame) {
     const uint8_t g = frame.payload[2];
     const uint8_t b = frame.payload[3];
     Serial.printf("[led-rx] z=%u r=%u g=%u b=%u\n", zone, r, g, b);
+    ledStateKnown = true;  // RP2040 has provided LED state; safe to sync to pad
     if (zone == 0xff) {
       setAllLightZones(r, g, b);
     } else {
@@ -747,7 +757,7 @@ static bool sendTagSet(uint8_t slot, uint32_t toyId) {
   writeU32Le(&payload[1], toyId);
   bool ok = sendFrameUart(LP_MSG_TAG_SET, payload, sizeof(payload));
   if (padKnown && padPaired) {
-    sendFrameUdp(LP_MSG_TAG_SET, payload, sizeof(payload));
+    sendFrameTcp(LP_MSG_TAG_SET, payload, sizeof(payload));
   }
   return ok;
 }
@@ -756,7 +766,7 @@ static bool sendTagClear(uint8_t slot) {
   const uint8_t payload[1] = {slot};  // slot (1-7) matches the index used in TAG_SET
   bool ok = sendFrameUart(LP_MSG_TAG_CLEAR, payload, sizeof(payload));
   if (padKnown && padPaired) {
-    sendFrameUdp(LP_MSG_TAG_CLEAR, payload, sizeof(payload));
+    sendFrameTcp(LP_MSG_TAG_CLEAR, payload, sizeof(payload));
   }
   return ok;
 }
@@ -857,7 +867,7 @@ static void sendStateJson() {
   if (padPaired) {
     json += padIp.toString();
     json += ":";
-    json += String(padPort);
+    json += String(padClient.connected() ? padClient.remotePort() : 0);
   } else {
     json += "-";
   }
@@ -1146,11 +1156,11 @@ static bool sendFrameUart(uint8_t type, const uint8_t* payload, uint8_t payloadL
   return true;
 }
 
-static bool sendFrameUdp(uint8_t type, const uint8_t* payload, uint8_t payloadLen,
+// Send an LP frame to the pad over TCP.  On write failure, tears down the TCP
+// connection immediately so processTcpIn() stops treating the pad as paired.
+static bool sendFrameTcp(uint8_t type, const uint8_t* payload, uint8_t payloadLen,
                          uint8_t forceSeq) {
-  if (!padKnown || !padPaired) {
-    return false;
-  }
+  if (!padKnown || !padPaired) return false;
 
   uint8_t wire[sizeof(lp_header_t) + LP_MAX_PAYLOAD + 2];
   uint16_t wireLen = 0;
@@ -1160,9 +1170,39 @@ static bool sendFrameUdp(uint8_t type, const uint8_t* payload, uint8_t payloadLe
     return false;
   }
 
-  udp.beginPacket(padIp, padPort);
-  udp.write(wire, wireLen);
-  return udp.endPacket() == 1;
+  const int cfd = padClient.fd();
+  if (cfd < 0) {
+    Serial.println("[console-esp32] tcp send: no fd — disconnecting");
+    padClient.stop();
+    padKnown    = false;
+    padPaired   = false;
+    padLastRxMs = 0;
+    return false;
+  }
+  // Use direct send() instead of padClient.write() to bypass the cached
+  // _connected flag, which write() checks first.  _connected can be set to
+  // false by padClient.connected() via a stale lwIP errno, causing write() to
+  // return 0 and tear down a perfectly healthy connection.
+  ssize_t n = ::send(cfd, wire, wireLen, MSG_DONTWAIT);
+  if (n < 0 && errno == EAGAIN) {
+    fd_set wset;
+    FD_ZERO(&wset);
+    FD_SET(cfd, &wset);
+    struct timeval tv = {0, 200000};  // 200 ms
+    if (::select(cfd + 1, NULL, &wset, NULL, &tv) > 0 && FD_ISSET(cfd, &wset)) {
+      n = ::send(cfd, wire, wireLen, MSG_DONTWAIT);
+    }
+  }
+  if (n != (ssize_t)wireLen) {
+    Serial.printf("[console-esp32] tcp write failed %zd/%u errno=%d — disconnecting\n",
+                  n, (unsigned)wireLen, errno);
+    padClient.stop();
+    padKnown    = false;
+    padPaired   = false;
+    padLastRxMs = 0;
+    return false;
+  }
+  return true;
 }
 
 static void sendAckUart(uint8_t receivedSeq) {
@@ -1170,72 +1210,114 @@ static void sendAckUart(uint8_t receivedSeq) {
   sendFrameUart(LP_MSG_ACK, payload, sizeof(payload));
 }
 
-static void sendAckUdp(uint8_t receivedSeq) {
+static void sendAckTcp(uint8_t receivedSeq) {
   const uint8_t payload[1] = {receivedSeq};
-  sendFrameUdp(LP_MSG_ACK, payload, sizeof(payload));
+  sendFrameTcp(LP_MSG_ACK, payload, sizeof(payload));
 }
 
-static void processUdpIn() {
-  const int packetSize = udp.parsePacket();
-  if (packetSize <= 0) {
+static void processTcpIn() {
+  // Accept incoming pad connection — always replace an existing one so the pad
+  // can reconnect after a crash without waiting for TCP keepalive timeout.
+  if (tcpServer.hasClient()) {
+    WiFiClient incoming = tcpServer.accept();
+    if (padKnown) {
+      Serial.println("[console-esp32] replacing existing pad connection");
+      padClient.stop();
+    }
+    padClient   = incoming;
+    padClient.setNoDelay(true);  // send LP frames immediately, no Nagle buffering
+    lp_stream_reset(&tcpParser);
+    padKnown    = true;
+    padPaired   = false;  // must re-handshake
+    padLastRxMs = millis();  // start timeout from connection time
+    padIp       = padClient.remoteIP();
+    Serial.print("[console-esp32] TCP pad connected from ");
+    Serial.println(padIp);
+  }
+
+  // Detect disconnect: no LP frame received from pad within kPadRxTimeoutMs.
+  // Avoids all lwIP recv()/select() quirks — only fires on genuine silence.
+  if (padKnown && (millis() - padLastRxMs) >= kPadRxTimeoutMs) {
+    Serial.printf("[console-esp32] TCP pad disconnected (rx timeout)\n");
+    padClient.stop();
+    padKnown    = false;
+    padPaired   = false;
+    padLastRxMs = 0;
     return;
   }
 
-  uint8_t inbuf[sizeof(lp_header_t) + LP_MAX_PAYLOAD + 2];
-  const int bytes = udp.read(inbuf, sizeof(inbuf));
-  if (bytes <= 0) {
-    return;
-  }
+  if (!padKnown) return;
 
-  lp_frame_t frame;
-  if (!lp_decode_frame(inbuf, (uint16_t)bytes, &frame)) {
-    Serial.println("[console-esp32] dropped bad UDP frame");
-    return;
-  }
+  // Read stream bytes
+  while (padClient.available()) {
+    const int c = padClient.read();
+    if (c < 0) break;
 
-  if (!padPaired) {
-    if (!isValidPadHello(frame)) {
-      Serial.println("[console-esp32] unpaired client ignored");
-      return;
+    lp_frame_t frame;
+    const lp_parse_result_t res = lp_stream_push(&tcpParser, (uint8_t)c, &frame);
+    if (res == LP_PARSE_FRAME_BAD_CRC) {
+      Serial.println("[console-esp32] dropped bad TCP frame");
+      continue;
+    }
+    if (res != LP_PARSE_FRAME_OK) continue;
+
+    if (!padPaired) {
+      if (!isValidPadHello(frame)) {
+        Serial.println("[console-esp32] unpaired client ignored");
+        continue;
+      }
+
+      padPaired = true;
+
+      if (frame.header.length == 1) {
+        // Force a new secret on fresh enrollment.
+        sharedSecret = 0;
+      }
+      ensureSecret();
+      uint8_t pairPayload[4];
+      writeU32Le(pairPayload, sharedSecret);
+      sendFrameTcp(LP_MSG_PAIR_SET, pairPayload, sizeof(pairPayload));
+
+      Serial.print("[console-esp32] paired with ");
+      Serial.println(padIp);
     }
 
-    padIp = udp.remoteIP();
-    padPort = udp.remotePort();
-    padKnown = true;
-    padPaired = true;
+    padLastRxMs = millis();  // refresh liveness timestamp on every valid frame
 
-    if (frame.header.length == 1) {
-      // Force a new secret on fresh enrollment.
-      sharedSecret = 0;
+    if (frame.header.type != LP_MSG_ACK) {
+      sendAckTcp(frame.header.seq);
     }
-    ensureSecret();
-    uint8_t pairPayload[4];
-    writeU32Le(pairPayload, sharedSecret);
-    sendFrameUdp(LP_MSG_PAIR_SET, pairPayload, sizeof(pairPayload));
 
-    Serial.print("[console-esp32] paired with ");
-    Serial.print(padIp);
-    Serial.print(":");
-    Serial.println(padPort);
+    observeFrameState(frame);
+
+    if (frame.header.type == LP_MSG_HELLO || frame.header.type == LP_MSG_PAIR_SET) {
+      continue;
+    }
+
+    // Debug messages from pad: print locally, do NOT forward to RP2040
+    // (forwarding would cause the RP2040 to echo them back, creating a loop).
+    if (frame.header.type == LP_MSG_DEBUG) {
+      if (kEnableUsbDebugConsole) {
+        char msg[LP_MAX_PAYLOAD + 1];
+        const uint8_t len = frame.header.length < LP_MAX_PAYLOAD
+                                ? frame.header.length : LP_MAX_PAYLOAD;
+        memcpy(msg, frame.payload, len);
+        msg[len] = '\0';
+        Serial.print("[pad-dbg] ");
+        Serial.println(msg);
+      }
+      continue;
+    }
+
+    // Re-encode and forward to RP2040 with original seq.
+    uint8_t wire[sizeof(lp_header_t) + LP_MAX_PAYLOAD + 2];
+    uint16_t wireLen = 0;
+    if (lp_encode_frame(frame.header.type, frame.header.seq,
+                        frame.payload, frame.header.length,
+                        wire, sizeof(wire), &wireLen)) {
+      Serial2.write(wire, wireLen);
+    }
   }
-
-  if (udp.remoteIP() != padIp || udp.remotePort() != padPort) {
-    Serial.println("[console-esp32] packet from non-paired peer dropped");
-    return;
-  }
-
-  if (frame.header.type != LP_MSG_ACK) {
-    sendAckUdp(frame.header.seq);
-  }
-
-  observeFrameState(frame);
-
-  if (frame.header.type == LP_MSG_HELLO || frame.header.type == LP_MSG_PAIR_SET) {
-    return;
-  }
-
-  // Forward all valid frames to RP2040; RP2040 can ignore what it does not use yet.
-  Serial2.write(inbuf, (size_t)bytes);
 }
 
 static void processUartIn() {
@@ -1276,8 +1358,11 @@ static void processUartIn() {
 
     observeFrameState(frame);
 
-    // Forward RP2040-originated frames (e.g. LED commands) to pad side.
-    sendFrameUdp(frame.header.type, frame.payload, frame.header.length);
+    // Only forward LED commands to the pad. Tag events flow console→RP2040,
+    // not the reverse; forwarding HELLOs/ACKs/etc. confuses the pad's LP state.
+    if (frame.header.type == LP_MSG_LED_CMD) {
+      sendFrameTcp(frame.header.type, frame.payload, frame.header.length);
+    }
   }
 }
 
@@ -1411,7 +1496,14 @@ static void setupAccessPoint() {
   apSsid = ssid;
 
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(apSsid.c_str());
+  WiFi.setSleep(false);  // keep radio active; reduces AP-side beacon gaps
+  // Use 192.168.44.x to avoid colliding with the pad's ToyPad-Setup AP
+  // (also on 192.168.4.x). Clients that previously connected to ToyPad-Setup
+  // would reuse their cached 192.168.4.x lease and fail to get an address here.
+  WiFi.softAPConfig(IPAddress(192, 168, 44, 1),
+                    IPAddress(192, 168, 44, 1),
+                    IPAddress(255, 255, 255, 0));
+  WiFi.softAP(apSsid.c_str(), nullptr, 1, 0, 8);  // open, ch1, visible, max 8 stations
 
   Serial.print("[console-esp32] AP SSID (open): ");
   Serial.println(apSsid);
@@ -1435,7 +1527,19 @@ void setup() {
 
   setupAccessPoint();
 
-  udp.begin(kPadListenPort);
+  // Log WiFi-layer station events so we can correlate them with TCP drops.
+  // (Arduino ESP32 2.x AP disconnect event has no reason code field.)
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    const uint8_t* m = info.wifi_ap_stadisconnected.mac;
+    Serial.printf("[console-esp32] WiFi STA left AP %02x:%02x:%02x:%02x:%02x:%02x\n",
+                  m[0], m[1], m[2], m[3], m[4], m[5]);
+  }, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    Serial.println("[console-esp32] WiFi STA joined AP");
+  }, ARDUINO_EVENT_WIFI_AP_STACONNECTED);
+
+  tcpServer.begin();
+  lp_stream_init(&tcpParser);
   sendHeartbeatToRp2040();
 }
 
@@ -1454,7 +1558,7 @@ void loop() {
     processUsbConsole();
   }
 
-  processUdpIn();
+  processTcpIn();
   processUartIn();
   dns.processNextRequest();
   web.handleClient();
@@ -1468,19 +1572,21 @@ void loop() {
   // a restart without waiting for the next change event.
   if ((now - lastStateSyncMs) >= kStateSyncMs) {
     lastStateSyncMs = now;
-    // All 7 slot states → RP2040 via UART; dedup on RP2040 prevents USB spam.
+    // Active slots → RP2040 via UART. Only occupied slots need syncing;
+    // empty slots are the RP2040's default state so TAG_CLEAR floods are
+    // unnecessary and overflow its event queue.
     for (uint8_t s = 1; s <= kSlotCount; s++) {
       if (padSlots[s - 1].occupied) {
         sendTagSet(s, padSlots[s - 1].toyId);
-      } else {
-        sendTagClear(s);
       }
     }
-    // All 3 LED zone states → pad-esp32 via UDP so it keeps the toypad lit.
-    if (padKnown && padPaired) {
+    // All 3 LED zone states → pad-esp32 so it keeps the toypad lit.
+    // Only send once RP2040 has provided real LED state; sending (0,0,0) before
+    // that would race with and extinguish the pad's pairing blink animation.
+    if (padKnown && padPaired && ledStateKnown) {
       for (uint8_t z = 0; z < kLightZoneCount; z++) {
         const uint8_t ledPayload[4] = {z, lightZones[z].r, lightZones[z].g, lightZones[z].b};
-        sendFrameUdp(LP_MSG_LED_CMD, ledPayload, sizeof(ledPayload));
+        sendFrameTcp(LP_MSG_LED_CMD, ledPayload, sizeof(ledPayload));
       }
     }
   }

@@ -76,19 +76,48 @@ echo ""
 echo -e "${BOLD}=== WirelessTP firmware build ===${RESET}"
 echo ""
 
+# Pre-scan: does FILTER match any exact env name or alias?
+# If so, only include entries where the alias/env name matches exactly
+# (avoids a directory name like "pad-esp32" pulling in all envs in that dir).
+FILTER_IS_EXACT=false
+if [[ -n "$FILTER" ]]; then
+  for _entry in "${TARGETS[@]}"; do
+    _env="${_entry##*:}"
+    _alias=""
+    case "$_env" in
+      console_rp2040_ps)    _alias="console-rp2040-ps" ;;
+      console_rp2040_xbox360) _alias="console-rp2040-xbox" ;;
+      pad_esp32)            _alias="pad-esp32" ;;
+      pad_esp32_nousb)      _alias="pad-esp32-nousb" ;;
+    esac
+    if [[ "$_env" == "$FILTER" || "$_alias" == "$FILTER" ]]; then
+      FILTER_IS_EXACT=true
+      break
+    fi
+  done
+fi
+
 for entry in "${TARGETS[@]}"; do
   fw_dir="${entry%%:*}"
   env_name="${entry##*:}"
 
   env_alias=""
   case "$env_name" in
-    console_rp2040_ps) env_alias="console-rp2040-ps" ;;
+    console_rp2040_ps)    env_alias="console-rp2040-ps" ;;
     console_rp2040_xbox360) env_alias="console-rp2040-xbox" ;;
+    pad_esp32)            env_alias="pad-esp32" ;;
+    pad_esp32_nousb)      env_alias="pad-esp32-nousb" ;;
   esac
 
-  # Apply optional target filter (directory, env name, or env alias)
-  if [[ -n "$FILTER" && "$fw_dir" != "$FILTER" && "$env_name" != "$FILTER" && "$env_alias" != "$FILTER" ]]; then
-    continue
+  # Apply optional target filter.
+  # If the filter is an exact alias/env-name, match only on those.
+  # Otherwise fall back to directory match (e.g. "console-rp2040" builds all rp2040 envs).
+  if [[ -n "$FILTER" ]]; then
+    if $FILTER_IS_EXACT; then
+      [[ "$env_name" != "$FILTER" && "$env_alias" != "$FILTER" ]] && continue
+    else
+      [[ "$fw_dir" != "$FILTER" ]] && continue
+    fi
   fi
 
   if build_target "$fw_dir" "$env_name"; then

@@ -15,8 +15,10 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
+#include <WiFiClient.h>
 #include <WebServer.h>
+#include <lwip/sockets.h>  // for direct send() — bypasses WiFiClient::_connected stale-errno
+#include <esp_system.h>        // for esp_reset_reason()
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
@@ -29,6 +31,7 @@ extern "C" {
 #endif
 
 #include "link_protocol.h"
+#include "ld_catalog_data.h"
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 static const char*    kSetupApSsid      = "ToyPad-Setup";
@@ -38,6 +41,9 @@ static const uint16_t kDnsPort          = 53;
 static const int      kResetPin         = 0;
 static const uint32_t kResetHoldMs     = 3000;
 static const uint16_t kConsolePort     = 25100;
+
+// Forward declaration — defined after startPadWeb().
+static void serviceFactoryReset();
 static const uint32_t kRetryMs         = 50;
 static const uint8_t  kMaxRetries      = 3;
 static const uint32_t kHelloMs         = 2000;   // HELLO interval while searching
@@ -66,6 +72,7 @@ static const uint32_t kBlinkOnMs    = 200;
 static const uint32_t kBlinkOffMs   = 200;
 static const uint32_t kSearchOnMs   = 400;
 static const uint32_t kSearchOffMs  = 400;
+static const uint32_t kPhysSyncMs   = 8000; // physical zone TAG_SET/TAG_CLEAR re-sync period
 
 #if PAD_USB_HOST
 // Startup B0 command: "55 0f b0 01 (c) LEGO 2014 <checksum>"
@@ -96,9 +103,9 @@ struct PadConfig {
 #if PAD_USB_HOST
 // Tag event decoded from a USB IN report (passed via FreeRTOS queue)
 struct TagEvent {
-  uint8_t lpZone;   // LP convention: 0=center, 1=left, 2=right
+  uint8_t lpZone;   // physical pad zone 0-2 (from d[2]-1): 0=center, 1=left, 2=right
   bool    placed;   // true=placed, false=removed
-  uint8_t uid[7];   // 7-byte NFC UID
+  uint8_t uid[7];   // 7-byte NFC UID — unique per toy, used as key for slot assignment
 };
 #endif  // PAD_USB_HOST
 
@@ -117,18 +124,22 @@ static usb_host_client_handle_t sUsbClient  = NULL;
 static usb_device_handle_t      sUsbDev     = NULL;
 static usb_transfer_t*          sUsbInXfer  = NULL;
 static usb_transfer_t*          sUsbOutXfer = NULL;
-static volatile bool            sUsbDevOpen = false;
-static volatile bool            sUsbOutBusy = false;
+static volatile bool            sUsbDevOpen  = false;
+static volatile bool            sUsbOutBusy  = false;
+static volatile uint8_t         sUsbNewDevCnt = 0;  // lifetime count of NEW_DEV events
+static volatile uint8_t         sUsbOpenOk    = 0;  // set to 1 when open succeeds
 static QueueHandle_t            sTagQueue   = NULL;
 static uint8_t                  sMsgNum     = 1;  // toypad OUT message counter
-// Zone occupancy tracked for periodic re-sync to console.
-static uint32_t sZoneToyId[3]    = {0, 0, 0};
-static uint8_t  sZoneUid[3][7]   = {};
-static bool     sZoneOccupied[3] = {false, false, false};
+// Per-slot occupancy for physical pad.  Index = slot-1 (0-6).
+// Slots are assigned from per-zone pools by forwardTagEvent, keyed by NFC UID.
+static uint32_t sSlotToyId[7]   = {};
+static uint8_t  sSlotUid[7][7]  = {};
+static bool     sSlotOccupied[7]= {};
 #endif
 
 // ─── WiFi / LP globals ────────────────────────────────────────────────────────
-static WiFiUDP   udp;
+static WiFiClient      client;
+static lp_stream_parser_t tcpParser;
 static WebServer web(kSetupPort);
 static DNSServer dns;
 static bool      apActive = false;  // true while provisioning AP is up
@@ -148,12 +159,34 @@ static uint8_t  blinkRemaining  = 0;
 static bool     blinkOn         = false;
 static uint32_t lastHeartbeatMs = 0;
 static uint32_t lastPeerMs      = 0;
+static int           sLastDiscErrno  = 0;   // errno from last TCP write failure (104=RST, 0=no-fd)
+static uint8_t       sDiscCnt        = 0;   // write failures since last pad-dbg report
+static uint8_t       sSearchCnt      = 0;   // CONN_SEARCHING entries since last pad-dbg
+static uint8_t       sConnCnt        = 0;   // client.connect() successes since last pad-dbg
+static uint8_t       sBootReason     = 0;   // esp_reset_reason() captured at startup
+static uint8_t       sBlinkWhy       = 0;   // 1=kLostMs 2=kPairTimeout triggered last CONN_BLINK_FAIL
+static uint32_t      sBlinkWhyPeerMs = 0;   // lastPeerMs snapshot when CONN_BLINK_FAIL triggered
+static volatile uint32_t sWifiDrops     = 0;   // WiFi STA_DISCONNECTED event count since last report
+static volatile uint8_t  sWifiDropRsn   = 0;   // reason code from last WiFi drop
+
+// ─── Virtual toy state (serial debug menu) ────────────────────────────────────
+// Slots 1-7, index = slot-1.  For USB-host builds slots 1-3 map to physical
+// zones; for no-USB builds all seven slots are virtual-only.
+static bool     sVirtualOccupied[7] = {};
+static uint32_t sVirtualToyId[7]    = {};
+
+// ─── Serial debug menu ────────────────────────────────────────────────────────
+struct CatalogMatch { uint16_t id; char name[40]; };
+enum MenuState : uint8_t { MENU_IDLE, MENU_SEARCH, MENU_SELECT };
+static MenuState menuState      = MENU_IDLE;
+static uint8_t   menuSlot       = 0;         // slot being placed
+static char      menuLine[64]   = {};
+static uint8_t   menuLineLen    = 0;
+static CatalogMatch menuMatches[20];
+static uint8_t   menuMatchCount = 0;
+static bool      menuStarted    = false;
 
 #if PAD_USB_HOST
-// LP zone 0-2 → canonical slot 1-7 (one slot per zone for passthrough)
-// zone 0=center→slot 2, zone 1=left→slot 1, zone 2=right→slot 3
-static const uint8_t kZoneToSlot[3] = {2, 1, 3};
-
 // ─── Toypad OUT report helpers ────────────────────────────────────────────────
 // Packet checksum: sum of all bytes from index 0 up to (but not including) the
 // checksum byte itself, mod 256.  Placed at buf[dataLen].
@@ -206,6 +239,167 @@ static void toypadLedZone(uint8_t lpZone, uint8_t r, uint8_t g, uint8_t b) {
   sendToToypad(buf);
 }
 
+// ─── Toypad B1/B3 authentication (TEA) ───────────────────────────────────────
+// The physical toypad ignores colour commands until a valid B0→B1→B1→B3
+// handshake has been completed.  Algorithm from RPCS3 Dimensions.cpp.
+static const uint8_t kPadCommandKey[16] = {
+  0x55, 0xFE, 0xF6, 0xB0, 0x62, 0xBF, 0x0B, 0x41,
+  0xC9, 0xB3, 0x7C, 0xB4, 0x97, 0x3E, 0x29, 0x7B,
+};
+
+static void padTeaEncrypt(const uint8_t* in, uint8_t* out) {
+  static const uint32_t kD = 0x9E3779B9u;
+  uint32_t v0 = (uint32_t)in[0] | ((uint32_t)in[1]<<8) | ((uint32_t)in[2]<<16) | ((uint32_t)in[3]<<24);
+  uint32_t v1 = (uint32_t)in[4] | ((uint32_t)in[5]<<8) | ((uint32_t)in[6]<<16) | ((uint32_t)in[7]<<24);
+  uint32_t k0 = (uint32_t)kPadCommandKey[0]  | ((uint32_t)kPadCommandKey[1] <<8) | ((uint32_t)kPadCommandKey[2] <<16) | ((uint32_t)kPadCommandKey[3] <<24);
+  uint32_t k1 = (uint32_t)kPadCommandKey[4]  | ((uint32_t)kPadCommandKey[5] <<8) | ((uint32_t)kPadCommandKey[6] <<16) | ((uint32_t)kPadCommandKey[7] <<24);
+  uint32_t k2 = (uint32_t)kPadCommandKey[8]  | ((uint32_t)kPadCommandKey[9] <<8) | ((uint32_t)kPadCommandKey[10]<<16) | ((uint32_t)kPadCommandKey[11]<<24);
+  uint32_t k3 = (uint32_t)kPadCommandKey[12] | ((uint32_t)kPadCommandKey[13]<<8) | ((uint32_t)kPadCommandKey[14]<<16) | ((uint32_t)kPadCommandKey[15]<<24);
+  uint32_t sum = 0;
+  for (int i = 0; i < 32; i++) {
+    sum += kD;
+    v0 += (((v1<<4)+k0) ^ (v1+sum) ^ ((v1>>5)+k1));
+    v1 += (((v0<<4)+k2) ^ (v0+sum) ^ ((v0>>5)+k3));
+  }
+  out[0]=(uint8_t)v0; out[1]=(uint8_t)(v0>>8); out[2]=(uint8_t)(v0>>16); out[3]=(uint8_t)(v0>>24);
+  out[4]=(uint8_t)v1; out[5]=(uint8_t)(v1>>8); out[6]=(uint8_t)(v1>>16); out[7]=(uint8_t)(v1>>24);
+}
+
+// B1 (Seed): TEA([seed_LE | conf_BE]).  Initialises the pad's RNG.
+static void sendToypadB1(uint32_t seed, uint32_t conf) {
+  uint8_t plain[8];
+  plain[0]=(uint8_t)seed;       plain[1]=(uint8_t)(seed>>8);
+  plain[2]=(uint8_t)(seed>>16); plain[3]=(uint8_t)(seed>>24);
+  plain[4]=(uint8_t)(conf>>24); plain[5]=(uint8_t)(conf>>16);
+  plain[6]=(uint8_t)(conf>>8);  plain[7]=(uint8_t)conf;
+  uint8_t enc[8]; padTeaEncrypt(plain, enc);
+  uint8_t buf[kReportSize] = {};
+  buf[0]=0x55; buf[1]=0x09; buf[2]=0xb1; buf[3]=sMsgNum++;
+  memcpy(&buf[4], enc, 8);
+  buf[12] = toypadChecksum(buf, 12);
+  sendToToypad(buf);
+}
+
+// B3 (Challenge): TEA([conf_BE | 00000000]).  Pad replies with next RNG value.
+static void sendToypadB3(uint32_t conf) {
+  uint8_t plain[8] = {};
+  plain[0]=(uint8_t)(conf>>24); plain[1]=(uint8_t)(conf>>16);
+  plain[2]=(uint8_t)(conf>>8);  plain[3]=(uint8_t)conf;
+  uint8_t enc[8]; padTeaEncrypt(plain, enc);
+  uint8_t buf[kReportSize] = {};
+  buf[0]=0x55; buf[1]=0x09; buf[2]=0xb3; buf[3]=sMsgNum++;
+  memcpy(&buf[4], enc, 8);
+  buf[12] = toypadChecksum(buf, 12);
+  sendToToypad(buf);
+}
+
+// ─── Physical toy ID resolution (NFC page 36 read + figure-key decrypt) ───────────
+// The LEGO Dimensions character ID lives encrypted in NFC page 36 of the figure’s
+// NTAG213 tag.  We send a D2 (block-read) command to the physical pad to fetch
+// it, then decrypt with the per-figure key derived from the real NFC UID.
+// Algorithm ported from RPCS3 Dimensions.cpp (CHAR_CONSTANT / scramble /
+// generate_figure_key).  Single-core ESP32-S2: volatile flag is sufficient.
+
+// D2 response state — written by usbInCallback (USB task), read by main loop.
+static volatile uint8_t sD2WaitCounter  = 0;    // counter we sent; 0 = not waiting
+static volatile bool    sD2ReplyReady   = false;
+static          uint8_t sD2PageData[16] = {};   // 4 pages of NFC data from D2 reply
+
+// From RPCS3 Dimensions.cpp CHAR_CONSTANT.
+static const uint8_t kCharConstant[17] = {
+  0xB7, 0xD5, 0xD7, 0xE6, 0xE7, 0xBA, 0x3C, 0xA8,
+  0xD8, 0x75, 0x47, 0x68, 0xCF, 0x23, 0xE9, 0xFE, 0xAA
+};
+
+static uint32_t padRotr32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+
+static uint32_t padDimRandomize(const uint8_t* key, uint8_t count) {
+  uint32_t s = 0;
+  for (uint8_t i = 0; i < count; i++) {
+    const uint32_t b = (uint32_t)key[i*4] | ((uint32_t)key[i*4+1]<<8) |
+                       ((uint32_t)key[i*4+2]<<16) | ((uint32_t)key[i*4+3]<<24);
+    s = b + padRotr32(s,25) + padRotr32(s,10) - s;
+  }
+  return s;
+}
+
+static uint32_t padFigScramble(const uint8_t uid[7], uint8_t count) {
+  uint8_t buf[24];  // 7 uid + 17 kCharConstant
+  memcpy(buf, uid, 7);
+  memcpy(buf + 7, kCharConstant, 17);
+  buf[count * 4 - 1] ^= count;
+  return padDimRandomize(buf, count);
+}
+
+static void padGenerateFigureKey(const uint8_t uid[7], uint8_t key[16]) {
+  const uint32_t s3 = padFigScramble(uid, 3);
+  const uint32_t s4 = padFigScramble(uid, 4);
+  const uint32_t s5 = padFigScramble(uid, 5);
+  const uint32_t s6 = padFigScramble(uid, 6);
+  key[0]=(s3>>24); key[1]=(s3>>16); key[2]=(s3>>8);  key[3]=s3;
+  key[4]=(s4>>24); key[5]=(s4>>16); key[6]=(s4>>8);  key[7]=s4;
+  key[8]=(s5>>24); key[9]=(s5>>16); key[10]=(s5>>8); key[11]=s5;
+  key[12]=(s6>>24); key[13]=(s6>>16); key[14]=(s6>>8); key[15]=s6;
+}
+
+// TEA decrypt with an arbitrary 16-byte key — inverse of padTeaEncrypt/teaEncryptWithKey.
+static void padTeaDecryptWithKey(const uint8_t* in, uint8_t* out, const uint8_t key[16]) {
+  static const uint32_t kD = 0x9E3779B9u;
+  uint32_t v0 = (uint32_t)in[0] | ((uint32_t)in[1]<<8) | ((uint32_t)in[2]<<16) | ((uint32_t)in[3]<<24);
+  uint32_t v1 = (uint32_t)in[4] | ((uint32_t)in[5]<<8) | ((uint32_t)in[6]<<16) | ((uint32_t)in[7]<<24);
+  const uint32_t k0=(uint32_t)key[0] |((uint32_t)key[1]<<8)|((uint32_t)key[2]<<16)|((uint32_t)key[3]<<24);
+  const uint32_t k1=(uint32_t)key[4] |((uint32_t)key[5]<<8)|((uint32_t)key[6]<<16)|((uint32_t)key[7]<<24);
+  const uint32_t k2=(uint32_t)key[8] |((uint32_t)key[9]<<8)|((uint32_t)key[10]<<16)|((uint32_t)key[11]<<24);
+  const uint32_t k3=(uint32_t)key[12]|((uint32_t)key[13]<<8)|((uint32_t)key[14]<<16)|((uint32_t)key[15]<<24);
+  uint32_t sum = kD * 32u;  // 0xC6EF3720
+  for (int i = 0; i < 32; i++) {
+    v1 -= (((v0<<4)+k2)^(v0+sum)^((v0>>5)+k3));
+    v0 -= (((v1<<4)+k0)^(v1+sum)^((v1>>5)+k1));
+    sum -= kD;
+  }
+  out[0]=(uint8_t)v0; out[1]=(uint8_t)(v0>>8); out[2]=(uint8_t)(v0>>16); out[3]=(uint8_t)(v0>>24);
+  out[4]=(uint8_t)v1; out[5]=(uint8_t)(v1>>8); out[6]=(uint8_t)(v1>>16); out[7]=(uint8_t)(v1>>24);
+}
+
+// Send D2 (block read) to the physical pad: read 4 pages starting at `page`.
+// Returns the counter byte used, which is stored in sD2WaitCounter by the caller.
+static uint8_t sendToypadD2(uint8_t figIndex, uint8_t page) {
+  const uint8_t ctr = sMsgNum++;
+  uint8_t buf[kReportSize] = {};
+  buf[0]=0x55; buf[1]=0x04; buf[2]=0xD2; buf[3]=ctr;
+  buf[4]=figIndex; buf[5]=page;
+  buf[6] = toypadChecksum(buf, 6);
+  sendToToypad(buf);
+  return ctr;
+}
+
+// Fetch NFC page 36 from the physical pad and decrypt with the per-figure key
+// to get the real LEGO Dimensions character ID.  Blocks up to 80 ms.
+// Returns 0 if the read fails or the decrypted ID is 0.
+static uint32_t readPhysicalToyId(const uint8_t uid[7]) {
+  if (!sUsbDevOpen) return 0;
+  sD2ReplyReady  = false;
+  sD2WaitCounter = sendToypadD2(0, 36);  // figIndex=0, start page 36
+  const uint32_t deadline = millis() + 80;
+  while (!sD2ReplyReady && (millis() < deadline)) {
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+  if (!sD2ReplyReady) {
+    sD2WaitCounter = 0;
+    Serial.println("[pad] D2 page36 timeout");
+    return 0;
+  }
+  // sD2PageData[0..7] = pages 36 and 37 (8 bytes, TEA-encrypted with figure key)
+  uint8_t figKey[16];
+  padGenerateFigureKey(uid, figKey);
+  uint8_t dec[8];
+  padTeaDecryptWithKey(sD2PageData, dec, figKey);
+  const uint32_t toyId = (uint32_t)dec[0] | ((uint32_t)dec[1]<<8) |
+                         ((uint32_t)dec[2]<<16) | ((uint32_t)dec[3]<<24);
+  Serial.printf("[pad] D2 ok toyId=0x%04lx\n", (unsigned long)toyId);
+  return toyId;
+}
+
 #else  // !PAD_USB_HOST — stub LED functions for no-USB builds
 static void toypadLedAll(uint8_t r, uint8_t g, uint8_t b) {
   Serial.printf("[pad-stub] led all r=%u g=%u b=%u\n", r, g, b);
@@ -227,22 +421,30 @@ static void usbInCallback(usb_transfer_t* xfer) {
       && xfer->actual_num_bytes >= 14) {
     const uint8_t* d = xfer->data_buffer;
     if (d[0] == 0x56 && d[1] == 0x0b) {
-      // Tag event format:
+      // Physical toypad IN report (verified from session logs):
       //  [0]=0x56 magic  [1]=0x0b length
       //  [2]=pad zone (1=center, 2=left, 3=right)
-      //  [3]=action (0=placed, 1=removed)
-      //  [4..5]=padding  [6..12]=UID (7 bytes)  [13]=checksum
+      //  [3]=0x00  [4]=0x00  [5]=action (0=placed, 1=removed)
+      //  [6..12]=NFC UID (7 bytes)  [13]=checksum
       const uint8_t padZone = d[2];
-      const uint8_t action  = d[3];
+      const uint8_t action  = d[5];  // 0=placed, 1=removed
       if (padZone >= 1 && padZone <= 3) {
         TagEvent evt;
-        evt.lpZone = padZone - 1;
+        evt.lpZone = padZone - 1;  // 0=center, 1=left, 2=right
         evt.placed = (action == 0);
         memcpy(evt.uid, &d[6], 7);
         xQueueSend(sTagQueue, &evt, 0);
       }
+    } else if (d[0] == 0x55 && d[1] == 0x12 && d[3] == 0x00) {
+      // D2 page-read response: [0x55, 0x12, counter, 0x00, <16 bytes NFC data>]
+      const uint8_t ctr = d[2];
+      if (sD2WaitCounter != 0 && ctr == sD2WaitCounter) {
+        memcpy(sD2PageData, &d[4], 16);
+        sD2WaitCounter = 0;   // clear before ready flag (ordering on single-core)
+        sD2ReplyReady  = true;
+      }
     }
-    // B0 reply (0x55...) and other IN data are silently consumed.
+    // All other 0x55 responses (B0, B1, B3 replies) are silently consumed.
   }
   // Keep polling as long as the device is open.
   if (sUsbDevOpen) {
@@ -306,12 +508,26 @@ static void openToypadDevice(uint8_t devAddr) {
   sUsbOutXfer->timeout_ms       = 1000;
 
   sUsbDevOpen = true;
+  sUsbOpenOk   = 1;
   usb_host_transfer_submit(sUsbInXfer);  // begin polling
 
-  // Initialise toypad with B0 startup command.
+  // Initialise: B0 wake command, then B1×2 + B3 auth so the pad accepts LEDs.
   vTaskDelay(pdMS_TO_TICKS(50));
   sendToToypad(kToypadB0Cmd);
+  vTaskDelay(pdMS_TO_TICKS(20));
+  sendToypadB1(esp_random(), esp_random());  // seed 1
+  vTaskDelay(pdMS_TO_TICKS(20));
+  sendToypadB1(esp_random(), esp_random());  // seed 2
+  vTaskDelay(pdMS_TO_TICKS(20));
+  sendToypadB3(esp_random());                // challenge
+  vTaskDelay(pdMS_TO_TICKS(20));
   Serial.println("[pad-usb] toypad ready");
+
+  // If already paired, restore standby green (covers USB reconnect after pairing).
+  if (connState == CONN_PAIRED) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+    toypadLedAll(kGR, kGG, kGB);
+  }
 }
 
 static void closeToypadDevice() {
@@ -332,6 +548,7 @@ static void closeToypadDevice() {
 // ─── USB client event callback ────────────────────────────────────────────────
 static void usbClientEventCb(const usb_host_client_event_msg_t* msg, void* /*arg*/) {
   if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
+    sUsbNewDevCnt++;
     openToypadDevice(msg->new_dev.address);
   } else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
     closeToypadDevice();
@@ -371,10 +588,53 @@ static void usbClientTask(void* /*arg*/) {
 #endif  // PAD_USB_HOST
 
 // ─── LP send helpers ──────────────────────────────────────────────────────────
-static bool udpSendWire(const uint8_t* data, uint16_t len) {
-  udp.beginPacket(consoleIp, kConsolePort);
-  udp.write(data, len);
-  return udp.endPacket() == 1;
+static bool tcpSendWire(const uint8_t* data, uint16_t len) {
+  // Use send() directly on the socket fd instead of client.write().
+  // WiFiClient::write() checks the stored _connected member which is set to
+  // false by connected() via a len=0 recv() that reads stale errno — causing
+  // spurious disconnects.  send() bypasses that flag and reflects true socket
+  // state.  client.fd() is safe: it just checks clientSocketHandle != NULL.
+  const int fd = client.fd();
+  if (fd < 0) {
+    // No socket handle at all — client was stopped or never connected.
+    sLastDiscErrno = 0;
+    sDiscCnt++;
+    sSearchCnt++;
+    Serial.println("[pad] tcpSendWire: no fd — disconnecting");
+    paired         = false;
+    lastPeerMs     = 0;
+    pending.active = false;
+    helloStartMs   = millis();
+    lastHelloMs    = 0;
+    connState      = CONN_SEARCHING;
+    return false;
+  }
+  int n = ::send(fd, data, len, MSG_DONTWAIT);
+  if (n == (int)len) return true;  // fast path — buffer had space
+  if (n < 0 && errno == EAGAIN) {
+    // Send buffer momentarily full — give it 200 ms then retry once.
+    fd_set wset;
+    FD_ZERO(&wset);
+    FD_SET(fd, &wset);
+    struct timeval tv = {0, 200000};  // 200 ms
+    if (select(fd + 1, NULL, &wset, NULL, &tv) > 0 && FD_ISSET(fd, &wset)) {
+      n = ::send(fd, data, len, MSG_DONTWAIT);
+      if (n == (int)len) return true;
+    }
+  }
+  sLastDiscErrno = (n < 0) ? errno : 0;
+  sDiscCnt++;
+  sSearchCnt++;
+  Serial.printf("[pad] tcpSendWire: send failed n=%d/%u errno=%d — disconnecting\n",
+                n, (unsigned)len, sLastDiscErrno);
+  client.stop();
+  paired         = false;
+  lastPeerMs     = 0;
+  pending.active = false;
+  helloStartMs   = millis();
+  lastHelloMs    = 0;
+  connState      = CONN_SEARCHING;
+  return false;
 }
 
 static bool sendFrame(uint8_t type, const uint8_t* payload, uint8_t payloadLen,
@@ -386,7 +646,7 @@ static bool sendFrame(uint8_t type, const uint8_t* payload, uint8_t payloadLen,
   if (!lp_encode_frame(type, seq, payload, payloadLen, wire, sizeof(wire), &wireLen)) {
     return false;
   }
-  if (!udpSendWire(wire, wireLen)) {
+  if (!tcpSendWire(wire, wireLen)) {
     return false;
   }
   if (trackAck) {
@@ -421,32 +681,74 @@ static void sendHello() {
 
 // ─── Tag forwarding ───────────────────────────────────────────────────────────
 #if PAD_USB_HOST
+// LP slot pools per zone.  The physical pad sends zone + UID; we assign the
+// first free slot from the zone's pool and track toys by UID.
+// Matches slotToLpZone() in console-rp2040: slot2=center, {1,4,5}=left, {3,6,7}=right.
+// padZone: 1=center (lpZone 0), 2=left (lpZone 1), 3=right (lpZone 2).
+static const uint8_t kZoneSlots[3][3] = {
+  {2, 0, 0},    // lpZone 0 (center): slot 2 only
+  {1, 4, 5},    // lpZone 1 (left):   slots 1, 4, 5
+  {3, 6, 7},    // lpZone 2 (right):  slots 3, 6, 7
+};
+static const uint8_t kZoneSlotCount[3] = {1, 3, 3};
+
 static void forwardTagEvent(const TagEvent& evt) {
   if (!paired) return;
-  const uint8_t slot = kZoneToSlot[evt.lpZone];
-
-  // Update zone occupancy for periodic re-sync.
-  sZoneOccupied[evt.lpZone] = evt.placed;
-  if (evt.placed) {
-    memcpy(sZoneUid[evt.lpZone], evt.uid, sizeof(sZoneUid[0]));
-    sZoneToyId[evt.lpZone] = (uint32_t)evt.uid[0] | ((uint32_t)evt.uid[1] << 8) |
-                              ((uint32_t)evt.uid[2] << 16) | ((uint32_t)evt.uid[3] << 24);
-  }
+  const uint8_t z      = evt.lpZone;
+  const uint8_t nSlots = kZoneSlotCount[z];
 
   if (evt.placed) {
-    // Use the first 4 bytes of the NFC UID as toyId (LE).
-    // The game will query NFC pages (D2) separately for full figure data.
+    // Ignore if this UID is already tracked in this zone (duplicate event).
+    for (uint8_t i = 0; i < nSlots; i++) {
+      const uint8_t s = kZoneSlots[z][i];
+      if (s && sSlotOccupied[s-1] && memcmp(sSlotUid[s-1], evt.uid, 7) == 0) return;
+    }
+    // Assign the first free slot in the zone's pool.
+    uint8_t slot = 0;
+    for (uint8_t i = 0; i < nSlots; i++) {
+      const uint8_t s = kZoneSlots[z][i];
+      if (s && !sSlotOccupied[s-1]) { slot = s; break; }
+    }
+    if (slot == 0) {
+      Serial.printf("[pad] zone %u full, dropping uid=%02x%02x%02x%02x\n",
+                    z, evt.uid[0], evt.uid[1], evt.uid[2], evt.uid[3]);
+      return;
+    }
+    // Read real LEGO character ID from NFC page 36 of the physical figure.
+    uint32_t toyId = readPhysicalToyId(evt.uid);
+    if (toyId == 0) {
+      // Fallback: UID bytes — game won’t recognise the toy but at least shows it.
+      toyId = (uint32_t)evt.uid[0] | ((uint32_t)evt.uid[1]<<8) |
+              ((uint32_t)evt.uid[2]<<16) | ((uint32_t)evt.uid[3]<<24);
+      Serial.printf("[pad] placed z=%u slot=%u uid=%02x%02x%02x%02x (UID fallback)\n",
+                    z, slot, evt.uid[0], evt.uid[1], evt.uid[2], evt.uid[3]);
+    } else {
+      Serial.printf("[pad] placed z=%u slot=%u uid=%02x%02x%02x%02x toyId=0x%04lx\n",
+                    z, slot, evt.uid[0], evt.uid[1], evt.uid[2], evt.uid[3],
+                    (unsigned long)toyId);
+    }
+    sSlotOccupied[slot-1] = true;
+    memcpy(sSlotUid[slot-1], evt.uid, 7);
+    sSlotToyId[slot-1] = toyId;
     uint8_t payload[5];
-    payload[0] = slot;
-    memcpy(&payload[1], evt.uid, 4);
+    payload[0]=slot; payload[1]=(uint8_t)toyId; payload[2]=(uint8_t)(toyId>>8);
+    payload[3]=(uint8_t)(toyId>>16); payload[4]=(uint8_t)(toyId>>24);
     sendFrame(LP_MSG_TAG_SET, payload, 5, true);
-    Serial.printf("[pad] placed z=%u slot=%u uid=%02x%02x%02x%02x...\n",
-                  evt.lpZone, slot,
-                  evt.uid[0], evt.uid[1], evt.uid[2], evt.uid[3]);
   } else {
+    // Find the slot holding this UID in this zone.
+    uint8_t slot = 0;
+    for (uint8_t i = 0; i < nSlots; i++) {
+      const uint8_t s = kZoneSlots[z][i];
+      if (s && sSlotOccupied[s-1] && memcmp(sSlotUid[s-1], evt.uid, 7) == 0) {
+        slot = s; break;
+      }
+    }
+    if (slot == 0) return;  // not tracked — ignore spurious removal
+    sSlotOccupied[slot-1] = false;
     const uint8_t payload[1] = {slot};
     sendFrame(LP_MSG_TAG_CLEAR, payload, 1, true);
-    Serial.printf("[pad] removed z=%u slot=%u\n", evt.lpZone, slot);
+    Serial.printf("[pad] removed z=%u slot=%u uid=%02x%02x%02x%02x\n",
+                  z, slot, evt.uid[0], evt.uid[1], evt.uid[2], evt.uid[3]);
   }
 }
 #endif  // PAD_USB_HOST
@@ -529,7 +831,7 @@ static void saveSharedSecret(uint32_t secret) {
   sharedSecret = secret;
 }
 
-// ─── Web UI (matches console-esp32 style) ────────────────────────────────────
+// ─── Web UI (status page only — debug via USB serial) ────────────────────────
 static const char kPadPortalPage[] = R"HTML(
 <!doctype html>
 <html>
@@ -548,19 +850,8 @@ static const char kPadPortalPage[] = R"HTML(
     .status-row { display:flex; flex-wrap:wrap; gap:4px; }
     h2 { margin:0 0 4px; font-size:1.1rem; }
     .muted { color:var(--muted); font-size:.85rem; }
-    label { display:block; margin-bottom:4px; font-size:.9rem; }
-    select,input[type=text],input[type=password] { width:100%; background:#192438; color:var(--ink); border:1px solid rgba(255,255,255,.22); border-radius:8px; padding:8px; margin-bottom:10px; font-size:.95rem; }
-    button.primary { background:#4f46e5; color:#fff; border:0; border-radius:8px; padding:10px 18px; font-weight:700; width:100%; }
-    button.primary:hover { background:#4338ca; }
-    .toy-row { display:flex; gap:8px; align-items:flex-end; }
-    .toy-row > div { flex:1; }
-    .toy-row button { flex-shrink:0; background:#2f855a; color:#fff; border:0; border-radius:8px; padding:10px 12px; font-weight:700; white-space:nowrap; }
-    .toy-row button:hover { background:#276749; }
-    .toy-row button.remove { background:#7b1d18; }
-    .toy-row button.remove:hover { background:#dc2626; }
-    .zone-row { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:8px; }
-    .zone-btn { background:#2d3a52; border:1px solid rgba(255,255,255,.2); border-radius:8px; padding:8px 4px; font-weight:700; color:var(--ink); }
-    .zone-btn:hover { background:#3e4f70; }
+    .hint { background:rgba(79,70,229,.15); border:1px solid rgba(79,70,229,.4); border-radius:8px; padding:10px 14px; font-size:.88rem; color:#a5b4fc; }
+    code { background:#1a2540; border-radius:4px; padding:1px 5px; font-size:.85rem; }
   </style>
 </head>
 <body>
@@ -573,28 +864,10 @@ static const char kPadPortalPage[] = R"HTML(
       <h3 style="margin-top:0">Status</h3>
       <div class="status-row" id="statusRow"></div>
     </div>
-    <div class="card">
-      <h3 style="margin-top:0">Debug — Place Virtual Toy</h3>
-      <div class="toy-row">
-        <div>
-          <label>Toy ID (hex or decimal)</label>
-          <input type="text" id="toyId" placeholder="e.g. 0x0001 or 1">
-        </div>
-        <div>
-          <label>Slot (1-7)</label>
-          <input type="text" id="toySlot" value="1" style="width:70px">
-        </div>
-        <button onclick="placeToy()">Place</button>
-      </div>
-      <div class="zone-row">
-        <button class="zone-btn" onclick="removeToy(1)">Remove Slot 1</button>
-        <button class="zone-btn" onclick="removeToy(2)">Remove Slot 2</button>
-        <button class="zone-btn" onclick="removeToy(3)">Remove Slot 3</button>
-        <button class="zone-btn" onclick="removeToy(4)">Remove Slot 4</button>
-        <button class="zone-btn" onclick="removeToy(5)">Remove Slot 5</button>
-        <button class="zone-btn" onclick="removeToy(6)">Remove Slot 6</button>
-        <button class="zone-btn" onclick="removeToy(7)">Remove Slot 7</button>
-      </div>
+    <div class="card hint">
+      Debug actions are available over the USB serial port.<br>
+      Connect via a terminal at 115200 baud and press any key to open the menu.<br>
+      Commands: <code>s</code> state &nbsp; <code>p &lt;slot&gt;</code> place &nbsp; <code>r &lt;slot&gt;</code> remove &nbsp; <code>f &lt;text&gt;</code> search
     </div>
     <div class="card">
       <h3 style="margin-top:0">WiFi</h3>
@@ -602,11 +875,6 @@ static const char kPadPortalPage[] = R"HTML(
     </div>
   </div>
   <script>
-    async function postJson(url, body) {
-      const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
-      if (!r.ok) throw new Error(await r.text());
-      return r.text();
-    }
     async function refresh() {
       try {
         const r = await fetch('/api/state', { cache:'no-store' });
@@ -621,45 +889,12 @@ static const char kPadPortalPage[] = R"HTML(
         document.getElementById('wifiStatus').textContent = 'SSID: ' + d.ssid + ' | IP: ' + d.ip;
       } catch (e) { document.getElementById('subtitle').textContent = 'Error: ' + e.message; }
     }
-    function parseToyId(v) {
-      v = v.trim();
-      if (v.startsWith('0x') || v.startsWith('0X')) return parseInt(v.slice(2), 16);
-      return parseInt(v, 10);
-    }
-    async function placeToy() {
-      const id = parseToyId(document.getElementById('toyId').value);
-      const slot = parseInt(document.getElementById('toySlot').value);
-      if (isNaN(id) || isNaN(slot) || slot < 1 || slot > 7) { alert('Invalid toy ID or slot'); return; }
-      try { await postJson('/api/toy/place', { id, slot }); await refresh(); }
-      catch (e) { alert('Failed: ' + e.message); }
-    }
-    async function removeToy(slot) {
-      try { await postJson('/api/toy/remove', { slot }); await refresh(); }
-      catch (e) { alert('Failed: ' + e.message); }
-    }
     refresh();
     setInterval(refresh, 2000);
   </script>
 </body>
 </html>
 )HTML";
-
-static bool parseJsonUint(const String& body, const char* key, uint32_t* out) {
-  const String needle = String('"') + key + '"';
-  int kp = body.indexOf(needle);
-  if (kp < 0) return false;
-  int cp = body.indexOf(':', kp + needle.length());
-  if (cp < 0) return false;
-  int s = cp + 1;
-  while (s < (int)body.length() && isspace((unsigned char)body[s])) s++;
-  int e = s;
-  while (e < (int)body.length() && body[e] != ',' && body[e] != '}') e++;
-  String t = body.substring(s, e);
-  t.trim();
-  if (t.startsWith("0x") || t.startsWith("0X")) *out = strtoul(t.c_str() + 2, NULL, 16);
-  else *out = strtoul(t.c_str(), NULL, 10);
-  return true;
-}
 
 static void handlePadRoot() {
   web.send(200, "text/html", kPadPortalPage);
@@ -687,40 +922,6 @@ static void handlePadState() {
   json += "\"";
   json += "}";
   web.send(200, "application/json", json);
-}
-
-static void handleToyPlace() {
-  const String body = web.arg("plain");
-  uint32_t toyId = 0, slot = 0;
-  if (!parseJsonUint(body, "id", &toyId) || !parseJsonUint(body, "slot", &slot)
-      || slot < 1 || slot > 7) {
-    web.send(400, "text/plain", "missing id/slot");
-    return;
-  }
-  if (!paired) { web.send(409, "text/plain", "not paired"); return; }
-  uint8_t payload[5];
-  payload[0] = (uint8_t)slot;
-  payload[1] = (uint8_t)(toyId);
-  payload[2] = (uint8_t)(toyId >> 8);
-  payload[3] = (uint8_t)(toyId >> 16);
-  payload[4] = (uint8_t)(toyId >> 24);
-  sendFrame(LP_MSG_TAG_SET, payload, 5, true);
-  Serial.printf("[pad-dbg] virtual place slot=%u id=0x%08lx\n", (unsigned)slot, (unsigned long)toyId);
-  web.send(200, "text/plain", "ok");
-}
-
-static void handleToyRemove() {
-  const String body = web.arg("plain");
-  uint32_t slot = 0;
-  if (!parseJsonUint(body, "slot", &slot) || slot < 1 || slot > 7) {
-    web.send(400, "text/plain", "missing slot");
-    return;
-  }
-  if (!paired) { web.send(409, "text/plain", "not paired"); return; }
-  const uint8_t payload[1] = {(uint8_t)slot};
-  sendFrame(LP_MSG_TAG_CLEAR, payload, 1, true);
-  Serial.printf("[pad-dbg] virtual remove slot=%u\n", (unsigned)slot);
-  web.send(200, "text/plain", "ok");
 }
 
 static void redirectToRoot() {
@@ -789,108 +990,426 @@ static void runProvisioningPortal() {
   web.on("/ncsi.txt",           HTTP_GET,  redirectToRoot);
   web.onNotFound(redirectToRoot);
   web.begin();
-  while (true) { dns.processNextRequest(); web.handleClient(); delay(5); }
+  while (true) {
+    dns.processNextRequest();
+    web.handleClient();
+    updateSearchBlink();
+    serviceFactoryReset();
+    delay(5);
+  }
 }
 
-static bool connectToConsoleAp() {
+// Start WiFi in the background — does not block.  consoleIp is resolved in
+// CONN_SEARCHING once the interface comes up.
+static void connectToConsoleAp() {
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);  // disable modem sleep for stable TCP connections
+  // Count WiFi-layer disconnect events so we can correlate them with TCP drops
+  // in the pad-dbg stream (drops=N rsn=reason in pad-dbg output).
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    sWifiDrops++;
+    sWifiDropRsn = info.wifi_sta_disconnected.reason;
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   if (cfg.pass.length() == 0) {
     WiFi.begin(cfg.ssid.c_str());
   } else {
     WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
   }
-  Serial.print("[pad] connecting to ");
-  Serial.println(cfg.ssid);
-  const uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(250);
-    if (millis() - start > 20000) {
-      Serial.println("[pad] wifi timeout");
-      return false;
-    }
-  }
-  consoleIp = WiFi.gatewayIP();
-  if (consoleIp == IPAddress((uint32_t)0)) consoleIp = IPAddress(192, 168, 4, 1);
-  Serial.print("[pad] console ip: ");
-  Serial.println(consoleIp);
-  return true;
+  Serial.printf("[pad] WiFi.begin → %s\n", cfg.ssid.c_str());
 }
 
+// ─── Toy catalog search ───────────────────────────────────────────────────────
+// Case-insensitive substring check (avoids pulling in <strings.h> strncasecmp).
+static bool containsCI(const char* hay, const char* needle) {
+  const size_t nl = strlen(needle);
+  if (nl == 0) return true;
+  for (; *hay; hay++) {
+    if (strncasecmp(hay, needle, nl) == 0) return true;
+  }
+  return false;
+}
+
+// Search kLdCatalogJson for entries whose name contains `query` (case-insens.).
+// Returns number of matches (up to maxOut).
+static uint8_t searchCatalog(const char* query, CatalogMatch* out, uint8_t maxOut) {
+  uint8_t count = 0;
+  const char* p = kLdCatalogJson;
+  while (count < maxOut) {
+    const char* idTag = strstr(p, "\"id\":");
+    if (!idTag) break;
+    p = idTag + 5;
+    // Parse id
+    uint16_t id = 0;
+    while (*p >= '0' && *p <= '9') { id = id * 10 + (uint16_t)(*p - '0'); p++; }
+    // Find name value
+    const char* nameTag = strstr(p, "\"name\":\"");
+    if (!nameTag) break;
+    const char* ns = nameTag + 8;
+    // Copy name until closing quote
+    char nameBuf[48]; uint8_t nl = 0;
+    while (ns[nl] && ns[nl] != '"' && nl < 47) { nameBuf[nl] = ns[nl]; nl++; }
+    nameBuf[nl] = '\0';
+    p = ns + nl;  // advance past name
+    // Skip non-specific entries
+    if (strcmp(nameBuf, "Unknown") == 0) continue;
+    if (strncmp(nameBuf, "Future Update", 13) == 0) continue;
+    if (strncmp(nameBuf, "World 1", 7) == 0) continue;
+    if (strncmp(nameBuf, "Lord Vortech", 12) == 0) continue;
+    if (strncmp(nameBuf, "* ", 2) == 0) continue;  // skip upgrade variants
+    // Match
+    if (containsCI(nameBuf, query)) {
+      out[count].id = id;
+      strncpy(out[count].name, nameBuf, 39);
+      out[count].name[39] = '\0';
+      count++;
+    }
+  }
+  return count;
+}
+
+// ─── Virtual toy helpers ──────────────────────────────────────────────────────
+static void virtualPlace(uint8_t slot, uint32_t toyId) {
+  if (slot < 1 || slot > 7) return;
+  sVirtualOccupied[slot - 1] = true;
+  sVirtualToyId[slot - 1]    = toyId;
+  if (!paired) {
+    Serial.println("  [not paired] cached — will sync once paired");
+    return;
+  }
+  uint8_t p[5] = {slot,
+    (uint8_t)toyId, (uint8_t)(toyId >> 8),
+    (uint8_t)(toyId >> 16), (uint8_t)(toyId >> 24)};
+  sendFrame(LP_MSG_TAG_SET, p, 5, true);
+  Serial.printf("  Placed ID 0x%04X on slot %u\n", toyId, slot);
+}
+
+static void virtualRemove(uint8_t slot) {
+  if (slot < 1 || slot > 7) return;
+  sVirtualOccupied[slot - 1] = false;
+  sVirtualToyId[slot - 1]    = 0;
+  if (!paired) {
+    Serial.printf("  [not paired] slot %u cached as empty\n", slot);
+    return;
+  }
+  const uint8_t p[1] = {slot};
+  sendFrame(LP_MSG_TAG_CLEAR, p, 1, true);
+  Serial.printf("  Removed slot %u\n", slot);
+}
+
+static void virtualRemoveAll() {
+  for (uint8_t s = 1; s <= 7; s++) virtualRemove(s);
+}
+
+// ─── Serial debug menu ────────────────────────────────────────────────────────
+static void menuPrintState() {
+  Serial.println();
+  Serial.print("  State  : ");
+  switch (connState) {
+    case CONN_SEARCHING:  Serial.println("searching"); break;
+    case CONN_BLINK_OK:   Serial.println("pairing");   break;
+    case CONN_BLINK_FAIL: Serial.println("fail");      break;
+    case CONN_PAIRED:     Serial.println("paired");    break;
+  }
+  Serial.printf("  Console: %s\n", paired ? consoleIp.toString().c_str() : "-");
+  Serial.printf("  WiFi   : %s / %s\n", cfg.ssid.c_str(), WiFi.localIP().toString().c_str());
+  Serial.println("  Slots:");
+  for (uint8_t s = 1; s <= 7; s++) {
+    if (sVirtualOccupied[s - 1]) {
+      Serial.printf("    [%u] virtual ID 0x%04X\n", s, sVirtualToyId[s - 1]);
+    } else {
+      Serial.printf("    [%u] empty\n", s);
+    }
+  }
+#if PAD_USB_HOST
+  bool anyPhys = false;
+  for (uint8_t si = 0; si < 7; si++) { if (sSlotOccupied[si]) { anyPhys = true; break; } }
+  if (anyPhys) {
+    Serial.println("  Physical slots (USB):");
+    for (uint8_t si = 0; si < 7; si++) {
+      if (sSlotOccupied[si]) {
+        Serial.printf("    slot%u  uid=%02X%02X%02X%02X\n",
+                      si + 1,
+                      sSlotUid[si][0], sSlotUid[si][1], sSlotUid[si][2], sSlotUid[si][3]);
+      }
+    }
+  }
+#endif
+}
+
+static void menuPrintHelp() {
+  Serial.println("\r\n=== Toy Pad Debug Menu ===");
+  Serial.println("  s              Show current state");
+  Serial.println("  p <slot>       Place virtual toy on slot 1-7");
+  Serial.println("                 (then type search text or a raw decimal ID)");
+  Serial.println("  r <slot>       Remove virtual toy from slot 1-7");
+  Serial.println("  r *            Remove all virtual toys");
+  Serial.println("  f <text>       Search toy catalog (characters only)");
+  Serial.println("  h              This help");
+  Serial.print("> ");
+}
+
+static void menuPrompt() { Serial.print("\r\n> "); }
+
+static void processMenuLine() {
+  const char* line = menuLine;
+  while (*line == ' ') line++;
+
+  switch (menuState) {
+
+    case MENU_IDLE: {
+      if (*line == '\0' || *line == 's') {
+        menuPrintState();
+        menuPrompt();
+        break;
+      }
+      if (*line == 'h' || *line == '?') {
+        menuPrintHelp();
+        break;
+      }
+      if (*line == 'p') {
+        const char* sp = line + 1;
+        while (*sp == ' ') sp++;
+        const uint8_t slot = (uint8_t)atoi(sp);
+        if (slot < 1 || slot > 7) {
+          Serial.println("  Usage: p <slot>  (1-7)");
+          menuPrompt();
+          break;
+        }
+        menuSlot  = slot;
+        menuState = MENU_SEARCH;
+        Serial.printf("  Slot %u — search (name, partial) or enter raw ID: ", slot);
+        break;
+      }
+      if (*line == 'r') {
+        const char* sp = line + 1;
+        while (*sp == ' ') sp++;
+        if (*sp == '*' || *sp == '0') {
+          virtualRemoveAll();
+          Serial.println("  All slots cleared");
+        } else {
+          const uint8_t slot = (uint8_t)atoi(sp);
+          if (slot < 1 || slot > 7) {
+            Serial.println("  Usage: r <slot>  (1-7) or r *");
+            menuPrompt();
+            break;
+          }
+          virtualRemove(slot);
+        }
+        menuPrompt();
+        break;
+      }
+      if (*line == 'f') {
+        const char* q = line + 1;
+        while (*q == ' ') q++;
+        if (*q == '\0') { Serial.println("  Usage: f <text>"); menuPrompt(); break; }
+        const uint8_t n = searchCatalog(q, menuMatches, 20);
+        if (n == 0) { Serial.println("  No matches."); menuPrompt(); break; }
+        Serial.printf("  %u match(es):\n", n);
+        for (uint8_t i = 0; i < n; i++) {
+          Serial.printf("  [%2u] %-38s  ID %u\n", i + 1, menuMatches[i].name, menuMatches[i].id);
+        }
+        menuPrompt();
+        break;
+      }
+      Serial.println("  Unknown. Type h for help.");
+      menuPrompt();
+      break;
+    }
+
+    case MENU_SEARCH: {
+      const char* q = line;
+      while (*q == ' ') q++;
+      if (*q == '\0') {
+        // Cancel
+        menuState = MENU_IDLE;
+        Serial.println("  Cancelled.");
+        menuPrompt();
+        break;
+      }
+      // Pure digits → treat as raw ID
+      bool isDigits = true;
+      for (const char* c = q; *c; c++) if (*c < '0' || *c > '9') { isDigits = false; break; }
+      if (isDigits) {
+        virtualPlace(menuSlot, (uint32_t)strtoul(q, nullptr, 10));
+        menuState = MENU_IDLE;
+        menuPrompt();
+        break;
+      }
+      // Search catalog
+      menuMatchCount = searchCatalog(q, menuMatches, 20);
+      if (menuMatchCount == 0) {
+        Serial.printf("  No matches for '%s'. Search again or enter raw ID: ", q);
+        break;  // stay in MENU_SEARCH
+      }
+      if (menuMatchCount == 1) {
+        Serial.printf("  → %s  (ID %u)\n", menuMatches[0].name, menuMatches[0].id);
+        virtualPlace(menuSlot, menuMatches[0].id);
+        menuState = MENU_IDLE;
+        menuPrompt();
+        break;
+      }
+      Serial.printf("  %u matches:\n", menuMatchCount);
+      for (uint8_t i = 0; i < menuMatchCount; i++) {
+        Serial.printf("  [%2u] %-38s  ID %u\n", i + 1, menuMatches[i].name, menuMatches[i].id);
+      }
+      Serial.printf("  Select 1-%u, blank=cancel: ", menuMatchCount);
+      menuState = MENU_SELECT;
+      break;
+    }
+
+    case MENU_SELECT: {
+      const char* q = line;
+      while (*q == ' ') q++;
+      if (*q == '\0') {
+        menuState = MENU_IDLE;
+        Serial.println("  Cancelled.");
+        menuPrompt();
+        break;
+      }
+      const int sel = atoi(q);
+      if (sel < 1 || sel > (int)menuMatchCount) {
+        Serial.printf("  Enter 1-%u or blank to cancel: ", menuMatchCount);
+        break;
+      }
+      const CatalogMatch& m = menuMatches[sel - 1];
+      Serial.printf("  → %s  (ID %u)\n", m.name, m.id);
+      virtualPlace(menuSlot, m.id);
+      menuState = MENU_IDLE;
+      menuPrompt();
+      break;
+    }
+  }
+}
+
+static void serviceSerialMenu() {
+  while (Serial.available()) {
+    const char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (!menuStarted) {
+      menuStarted  = true;
+      menuLineLen  = 0;
+      menuState    = MENU_IDLE;
+      menuPrintHelp();
+      continue;
+    }
+    if (c == '\n') {
+      menuLine[menuLineLen] = '\0';
+      Serial.println();
+      processMenuLine();
+      menuLineLen = 0;
+      continue;
+    }
+    if ((c == '\b' || c == 127) && menuLineLen > 0) {
+      menuLineLen--;
+      Serial.print("\b \b");
+      continue;
+    }
+    if (menuLineLen < (uint8_t)(sizeof(menuLine) - 1)) {
+      menuLine[menuLineLen++] = c;
+      Serial.print(c);
+    }
+  }
+}
+
+// ─── STA web server ───────────────────────────────────────────────────────────
 static void startPadWeb() {
-  web.on("/",              HTTP_GET,  handlePadRoot);
-  web.on("/api/state",     HTTP_GET,  handlePadState);
-  web.on("/api/toy/place", HTTP_POST, handleToyPlace);
-  web.on("/api/toy/remove",HTTP_POST, handleToyRemove);
+  web.on("/",          HTTP_GET, handlePadRoot);
+  web.on("/api/state", HTTP_GET, handlePadState);
   web.begin();
 }
 
-static void maybeFactoryReset() {
-  pinMode(kResetPin, INPUT_PULLUP);
-  if (digitalRead(kResetPin) != LOW) return;
-  const uint32_t start = millis();
-  while (digitalRead(kResetPin) == LOW) {
-    if (millis() - start >= kResetHoldMs) {
-      Serial.println("[pad] factory reset");
+// Non-blocking factory reset: call every loop iteration.
+// Holding the BOOT button (GPIO0) for kResetHoldMs triggers NVS wipe + reboot.
+static uint32_t sResetHoldStart = 0;
+static void serviceFactoryReset() {
+  if (digitalRead(kResetPin) == LOW) {
+    if (sResetHoldStart == 0) sResetHoldStart = millis();
+    if (millis() - sResetHoldStart >= kResetHoldMs) {
+      Serial.println("[pad] factory reset (BOOT held)");
       clearConfig();
-      break;
+      delay(200);
+      ESP.restart();
     }
-    delay(20);
+  } else {
+    sResetHoldStart = 0;
   }
 }
 
-// ─── UDP receive ──────────────────────────────────────────────────────────────
-static void processUdpIn() {
-  if (udp.parsePacket() <= 0) return;
+// ─── TCP receive ──────────────────────────────────────────────────────────────
+static void processTcpIn(uint32_t now) {
+  // No client.connected() check — available() returns 0 when not connected so
+  // the loop is a safe no-op, and connected() has stale-errno false positives.
+  // Use the caller's `now` (captured before this call) so that lastPeerMs never
+  // exceeds `now`.  If we used millis() here, lastPeerMs could be slightly
+  // greater than `now`, causing (now - lastPeerMs) to wrap to ~UINT32_MAX and
+  // trigger kLostMs on every frame received.
+  while (client.available()) {
+    const int c = client.read();
+    if (c < 0) break;
 
-  uint8_t buf[sizeof(lp_header_t) + LP_MAX_PAYLOAD + 2];
-  const int bytes = udp.read(buf, sizeof(buf));
-  if (bytes <= 0) return;
+    lp_frame_t frame;
+    const lp_parse_result_t res = lp_stream_push(&tcpParser, (uint8_t)c, &frame);
+    if (res == LP_PARSE_FRAME_BAD_CRC) continue;
+    if (res != LP_PARSE_FRAME_OK) continue;
 
-  lp_frame_t frame;
-  if (!lp_decode_frame(buf, (uint16_t)bytes, &frame)) return;
+    lastPeerMs = now;
 
-  lastPeerMs = millis();
-
-  // ACK
-  if (frame.header.type == LP_MSG_ACK && frame.header.length == 1) {
-    if (pending.active && frame.payload[0] == pending.seq) pending.active = false;
-    return;
-  }
-
-  // PAIR_SET — console accepted us
-  if (frame.header.type == LP_MSG_PAIR_SET && frame.header.length == 4) {
-    const uint32_t secret =
-        (uint32_t)frame.payload[0]        |
-        ((uint32_t)frame.payload[1] << 8)  |
-        ((uint32_t)frame.payload[2] << 16) |
-        ((uint32_t)frame.payload[3] << 24);
-    saveSharedSecret(secret);
-    sendAck(frame.header.seq);
-    pending.active = false;
-    paired     = true;
-    connState  = CONN_BLINK_OK;
-    startBlink(kBlinkCount);
-    Serial.println("[pad] paired");
-    return;
-  }
-
-  // LED_CMD — forward to physical toypad
-  if (frame.header.type == LP_MSG_LED_CMD && frame.header.length >= 4) {
-    sendAck(frame.header.seq);
-    const uint8_t zone = frame.payload[0];
-    const uint8_t r    = frame.payload[1];
-    const uint8_t g    = frame.payload[2];
-    const uint8_t b    = frame.payload[3];
-    if (zone == 0xff) {
-      toypadLedAll(r, g, b);
-    } else {
-      toypadLedZone(zone, r, g, b);
+    // ACK
+    if (frame.header.type == LP_MSG_ACK && frame.header.length == 1) {
+      if (pending.active && frame.payload[0] == pending.seq) pending.active = false;
+      continue;
     }
-    return;
-  }
 
-  // Everything else: ack and ignore
-  sendAck(frame.header.seq);
+    // PAIR_SET — console accepted us
+    if (frame.header.type == LP_MSG_PAIR_SET && frame.header.length == 4) {
+      const uint32_t secret =
+          (uint32_t)frame.payload[0]         |
+          ((uint32_t)frame.payload[1] << 8)  |
+          ((uint32_t)frame.payload[2] << 16) |
+          ((uint32_t)frame.payload[3] << 24);
+      saveSharedSecret(secret);
+      sendAck(frame.header.seq);
+      if (client.fd() < 0) {
+        // sendAck failed — tcpSendWire already called client.stop() and set
+        // connState=CONN_SEARCHING.  Don't overwrite with CONN_BLINK_OK.
+        continue;
+      }
+      pending.active = false;
+      paired     = true;
+      // Discard any USB events that queued up before we had a console link.
+      // They are stale initialisation events that would generate spurious
+      // TAG_CLEARs for zones that were never occupied this session.
+#if PAD_USB_HOST
+      if (sTagQueue) {
+        TagEvent dummy;
+        while (xQueueReceive(sTagQueue, &dummy, 0) == pdTRUE) {}
+        Serial.println("[pad] flushed pre-pair tag queue");
+      }
+#endif
+      connState  = CONN_BLINK_OK;
+      startBlink(kBlinkCount);
+      Serial.println("[pad] paired");
+      continue;
+    }
+
+    // LED_CMD — forward to physical toypad
+    if (frame.header.type == LP_MSG_LED_CMD && frame.header.length >= 4) {
+      sendAck(frame.header.seq);
+      const uint8_t zone = frame.payload[0];
+      const uint8_t r    = frame.payload[1];
+      const uint8_t g    = frame.payload[2];
+      const uint8_t b    = frame.payload[3];
+      if (zone == 0xff) {
+        toypadLedAll(r, g, b);
+      } else {
+        toypadLedZone(zone, r, g, b);
+      }
+      continue;
+    }
+
+    // Everything else: ack and ignore
+    sendAck(frame.header.seq);
+  }
 }
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
@@ -898,27 +1417,31 @@ void setup() {
   // On S2 Mini with USB CDC disabled, Serial routes to UART0 (GPIO 43/44).
   Serial.begin(115200);
   delay(300);
-  Serial.println("[pad] boot");
+  sBootReason = (uint8_t)esp_reset_reason();
+  Serial.printf("[pad] boot, reset reason: %u\n", sBootReason);
 
-  maybeFactoryReset();
+  pinMode(kResetPin, INPUT_PULLUP);  // BOOT button — monitored by serviceFactoryReset()
+
   cfg = loadConfig();
-  if (!cfg.valid)            runProvisioningPortal();  // blocks until saved+reboot
-  if (!connectToConsoleAp()) runProvisioningPortal();  // blocks until saved+reboot
+  if (!cfg.valid) runProvisioningPortal();  // blocks until saved+reboot
+  connectToConsoleAp();  // start WiFi in background; does not block
 
-  // Connected as STA — serve the debug/status web UI.
+  // Start the debug/status web UI (reachable once WiFi connects).
   startPadWeb();
 
-  udp.begin(25101);
+  lp_stream_init(&tcpParser);
 
 #if PAD_USB_HOST
   sTagQueue = xQueueCreate(8, sizeof(TagEvent));
 
   // USB lib task must start first; notify this task when ready.
   TaskHandle_t self = xTaskGetCurrentTaskHandle();
-  xTaskCreate(usbLibTask, "usb_lib", 4096, self, configMAX_PRIORITIES - 1, NULL);
+  // USB tasks: priority BELOW the WiFi task (23 on ESP32-S2 single-core) so
+  // USB event processing never starves the TCP/IP stack.
+  xTaskCreate(usbLibTask, "usb_lib", 4096, self, 5, NULL);
   ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));  // wait for USB host install
 
-  xTaskCreate(usbClientTask, "usb_cli", 4096, NULL, configMAX_PRIORITIES - 2, NULL);
+  xTaskCreate(usbClientTask, "usb_cli", 4096, NULL, 5, NULL);
 #endif
 
   helloStartMs = millis();
@@ -930,7 +1453,8 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
 
-  processUdpIn();
+  serviceFactoryReset();
+  processTcpIn(now);
 
   // Retry pending LP frame
   if (pending.active && (now - pending.lastSentMs) >= kRetryMs) {
@@ -939,7 +1463,7 @@ void loop() {
     } else {
       pending.retries++;
       pending.lastSentMs = now;
-      udpSendWire(pending.wire, pending.wireLen);
+      tcpSendWire(pending.wire, pending.wireLen);
     }
   }
 
@@ -948,7 +1472,31 @@ void loop() {
 
     case CONN_SEARCHING:
       updateSearchBlink();
-      if (!pending.active && (now - lastHelloMs) >= kHelloMs) {
+      // Resolve console IP from the gateway the first time WiFi comes up.
+      if (WiFi.status() == WL_CONNECTED && consoleIp == IPAddress(192, 168, 4, 1)) {
+        IPAddress gw = WiFi.gatewayIP();
+        if (gw != IPAddress((uint32_t)0)) {
+          consoleIp = gw;
+          Serial.printf("[pad] console ip: %s\n", consoleIp.toString().c_str());
+        }
+      }
+      // Maintain TCP connection to console (only while WiFi is up).
+      // Use client.fd() < 0 instead of !client.connected(): connected() does a
+      // len=0 recv() which always returns 0 but leaves errno stale from the
+      // previous syscall.  If that stale errno is ECONNRESET (104), connected()
+      // sets _connected=false, and the subsequent write() returns 0 immediately
+      // → false disconnect.  client.fd() < 0 just checks clientSocketHandle and
+      // has no errno side-effects.
+      if (WiFi.status() == WL_CONNECTED && client.fd() < 0) {
+        if (client.connect(consoleIp, kConsolePort)) {
+          sConnCnt++;
+          client.setNoDelay(true);  // send LP frames immediately, no Nagle buffering
+          lp_stream_reset(&tcpParser);
+          pending.active = false;
+          Serial.println("[pad] tcp connected");
+        }
+      }
+      if (client.fd() >= 0 && !pending.active && (now - lastHelloMs) >= kHelloMs) {
         lastHelloMs = now;
         sendHello();
       }
@@ -956,6 +1504,9 @@ void loop() {
       if ((now - helloStartMs) >= kPairTimeoutMs) {
         helloStartMs = now;
         blinkLastMs  = 0;
+        sBlinkWhy = 2;
+        sBlinkWhyPeerMs = lastPeerMs;
+        client.stop();
         connState    = CONN_BLINK_FAIL;
         startBlink(kBlinkCount);
       }
@@ -966,6 +1517,9 @@ void loop() {
         connState = CONN_PAIRED;
         lastHeartbeatMs = now;
         lastPeerMs      = now;
+        // Hold green on all zones as a standby indicator until the game sends
+        // its first LED_CMD.  The game will override this on initialisation.
+        toypadLedAll(kGR, kGG, kGB);
         Serial.println("[pad] paired and ready");
         // Shut down provisioning AP now that we have a console link.
         // (apActive is false when we were already paired on boot.)
@@ -982,19 +1536,26 @@ void loop() {
       if (updateBlink(kRR, kRG, kRB)) {
         blinkLastMs  = 0;
         helloStartMs = now;
+        sSearchCnt++;
         connState    = CONN_SEARCHING;
       }
       break;
 
     case CONN_PAIRED:
+      // client.connected() is NOT used for disconnect detection here — on ESP32
+      // lwIP it reads stale errno and causes false positives every ~1 s.
+      // Disconnects are detected via write failure (tcpSendWire) and kLostMs timeout.
       // Periodic heartbeat
       if ((now - lastHeartbeatMs) >= kHeartbeatMs) {
         lastHeartbeatMs = now;
         if (!pending.active) sendHello();
       }
-      // Detect console lost
+      // Detect console lost (no response to heartbeats)
       if (lastPeerMs > 0 && (now - lastPeerMs) >= kLostMs) {
         Serial.println("[pad] console lost");
+        sBlinkWhy = 1;
+        sBlinkWhyPeerMs = lastPeerMs;
+        client.stop();
         paired     = false;
         lastPeerMs = 0;
         blinkLastMs = 0;
@@ -1010,18 +1571,20 @@ void loop() {
           forwardTagEvent(evt);
         }
       }
-      // Periodic re-sync: re-send current physical pad state so the console
-      // recovers the correct figure list after a restart or re-pair.
+      // Periodic re-sync: broadcast full physical pad state every kPhysSyncMs.
+      // TAG_SET for occupied slots, TAG_CLEAR for empty — lets the RP2040 correct
+      // its state within one sync period even if a removal event was missed.
+      // Covers all 7 physical slots.
       {
         static uint32_t lastPadSyncMs = 0;
-        if ((now - lastPadSyncMs) >= kStateSyncMs) {
+        if ((now - lastPadSyncMs) >= kPhysSyncMs) {
           lastPadSyncMs = now;
-          for (uint8_t z = 0; z < 3; z++) {
-            const uint8_t s = kZoneToSlot[z];
-            if (sZoneOccupied[z]) {
+          for (uint8_t si = 0; si < 7; si++) {
+            const uint8_t s = si + 1;
+            if (sSlotOccupied[si]) {
               uint8_t p[5] = {s,
-                (uint8_t)sZoneToyId[z],        (uint8_t)(sZoneToyId[z] >> 8),
-                (uint8_t)(sZoneToyId[z] >> 16), (uint8_t)(sZoneToyId[z] >> 24)};
+                (uint8_t)sSlotToyId[si],        (uint8_t)(sSlotToyId[si] >> 8),
+                (uint8_t)(sSlotToyId[si] >> 16), (uint8_t)(sSlotToyId[si] >> 24)};
               sendFrame(LP_MSG_TAG_SET, p, 5, false);
             } else {
               const uint8_t p[1] = {s};
@@ -1031,9 +1594,66 @@ void loop() {
         }
       }
 #endif
+      // Periodic re-sync of virtual toy slots.
+      // USB host: skip any slot that has a physical toy present.
+      // No-USB:   covers all slots 1-7.
+      {
+        static uint32_t lastVirtSyncMs = 0;
+        if ((now - lastVirtSyncMs) >= kStateSyncMs) {
+          lastVirtSyncMs = now;
+          for (uint8_t s = 1; s <= 7; s++) {
+#if PAD_USB_HOST
+            if (sSlotOccupied[s - 1]) continue;  // physical toy present
+#endif
+            if (sVirtualOccupied[s - 1]) {
+              const uint32_t id = sVirtualToyId[s - 1];
+              uint8_t p[5] = {s, (uint8_t)id, (uint8_t)(id >> 8),
+                              (uint8_t)(id >> 16), (uint8_t)(id >> 24)};
+              sendFrame(LP_MSG_TAG_SET, p, 5, false);
+            }
+            // Don't send TAG_CLEAR for empty virtual slots — same reason as above.
+          }
+        }
+      }
+      // Periodic WiFi diagnostics forwarded to console so we can correlate
+      // signal quality with TCP disconnects without accessing the pad serial.
+      // Format: rssi=<dBm> wf=<status> disc=<errno> drops=<N> rsn=<wifi_reason>
+      //   drops: count of WiFi STA_DISCONNECTED events since last report
+      //   rsn:   wifi_err_reason_t from last WiFi drop (200=BEACON_TIMEOUT, etc.)
+      {
+        static uint32_t lastPadDbgMs = 0;
+        if ((now - lastPadDbgMs) >= 1000) {
+          lastPadDbgMs = now;
+          sWifiDrops = 0;   // reset (no longer reported — saves space)
+          char dbg[96];
+          // Keep under LP_MAX_PAYLOAD=64 bytes.  Drop wf/drops/rsn (always stable).
+          // uev=new-dev events, uok=open-succeeded flag, usb=current open state.
+          snprintf(dbg, sizeof(dbg),
+                   "rssi=%d fail=%u ern=%d srch=%u conn=%u why=%u uev=%u uok=%u usb=%u",
+                   (int)WiFi.RSSI(),
+                   (unsigned)sDiscCnt, sLastDiscErrno,
+                   (unsigned)sSearchCnt, (unsigned)sConnCnt,
+                   (unsigned)sBlinkWhy,
+#if PAD_USB_HOST
+                   (unsigned)sUsbNewDevCnt, (unsigned)sUsbOpenOk,
+                   sUsbDevOpen ? 1u : 0u
+#else
+                   0u, 0u, 0u
+#endif
+                   );
+          sLastDiscErrno = 0;
+          sDiscCnt   = 0;
+          sSearchCnt = 0;
+          sConnCnt   = 0;
+          sBlinkWhy  = 0;
+          sBlinkWhyPeerMs = 0;
+          sendFrame(LP_MSG_DEBUG, (const uint8_t*)dbg, (uint8_t)strlen(dbg), false);
+        }
+      }
       break;
   }
 
+  serviceSerialMenu();
   dns.processNextRequest();
   web.handleClient();
   delay(5);
