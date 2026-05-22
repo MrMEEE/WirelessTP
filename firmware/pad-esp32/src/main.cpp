@@ -132,12 +132,16 @@ static volatile uint8_t         sUsbOpenOk    = 0;  // set to 1 when open succee
 static QueueHandle_t            sTagQueue   = NULL;
 static uint8_t                  sMsgNum     = 1;  // toypad OUT message counter
 // Per-slot occupancy for physical pad.  Index = slot-1 (0-6).
-// Slots are assigned from per-zone pools by forwardTagEvent, keyed by NFC UID.
+// Slots 1-7 are assigned from a global pool (not per-zone); the same slot
+// is reused when a toy moves between zones so the figure index stays stable.
 static uint32_t sSlotToyId[7]   = {};
 static uint8_t  sSlotUid[7][7]  = {};
 static bool     sSlotOccupied[7]= {};
+static uint8_t  sSlotZone[7]    = {};  // lpZone (0=center,1=left,2=right) of each slot
 // Last D2 outcome — filled by readPhysicalToyId, sent as LP debug in forwardTagEvent.
 static char     sLastD2Status[32] = "d2:init";
+// Diagnostic: all-4-variant decryption results from last physical read.
+static char     sLastD2Debug[160] = "";
 #endif
 
 // ─── WiFi / LP globals ────────────────────────────────────────────────────────
@@ -172,6 +176,21 @@ static uint32_t      sBlinkWhyPeerMs = 0;   // lastPeerMs snapshot when CONN_BLI
 static volatile uint32_t sWifiDrops     = 0;   // WiFi STA_DISCONNECTED event count since last report
 static volatile uint8_t  sWifiDropRsn   = 0;   // reason code from last WiFi drop
 static uint32_t          sLastLedCmdMs  = 0;   // millis() of last LP LED_CMD from game; 0 = never/idle
+#if PAD_USB_HOST
+// Pending LED zone colours, flushed to USB in flushPendingLed() after processTcpIn().
+// Coalescing zone-0/1/2 bursts into a single toypadLedAll() eliminates USB timing skew.
+static uint8_t           sLedR[3]       = {};
+static uint8_t           sLedG[3]       = {};
+static uint8_t           sLedB[3]       = {};
+static uint8_t           sLedDirty      = 0;   // bitmask: bit z → zone z needs USB flush
+// Last colour actually sent to all zones via toypadLedAll(); used to deduplicate
+// the periodic state-sync frames (sent every ~1 s by both console-esp32 and
+// console-rp2040) that would otherwise cancel in-flight blink animations.
+static bool              sLedLastSentValid = false;
+static uint8_t           sLedLastSentR     = 0;
+static uint8_t           sLedLastSentG     = 0;
+static uint8_t           sLedLastSentB     = 0;
+#endif
 
 // ─── Virtual toy state (serial debug menu) ────────────────────────────────────
 // Slots 1-7, index = slot-1.  For USB-host builds slots 1-3 map to physical
@@ -232,15 +251,57 @@ static bool sendToToypad(const uint8_t* cmd) {
 }
 
 static void toypadLedAll(uint8_t r, uint8_t g, uint8_t b) {
+  // Wait for any in-flight OUT transfer so consecutive zone commands don't get dropped.
+  for (int i = 0; i < 10 && sUsbOutBusy; i++) vTaskDelay(pdMS_TO_TICKS(1));
   uint8_t buf[kReportSize];
   buildC0(buf, 0, r, g, b);
   sendToToypad(buf);
 }
 
 static void toypadLedZone(uint8_t lpZone, uint8_t r, uint8_t g, uint8_t b) {
+  // Wait for any in-flight OUT transfer so consecutive zone commands don't get dropped.
+  for (int i = 0; i < 10 && sUsbOutBusy; i++) vTaskDelay(pdMS_TO_TICKS(1));
   uint8_t buf[kReportSize];
   buildC0(buf, lpZoneToPadIdx(lpZone), r, g, b);
   sendToToypad(buf);
+}
+
+// Flush buffered LED zone colours to the physical toypad.  Called from loop()
+// after processTcpIn() so that all pending TCP frames are absorbed first; this
+// lets us coalesce a burst of per-zone commands into a single toypadLedAll()
+// call when all zones share the same colour (the common blink case).
+static void flushPendingLed() {
+  if (!sLedDirty) return;
+  if (!sUsbDevOpen) { sLedDirty = 0; sLedLastSentValid = false; return; }
+
+  // If all 3 zones share the same colour (dirty or not), use a single all-zones
+  // command.  We check *all* zones regardless of sLedDirty so that partial dirty
+  // batches (e.g. only 1–2 zones updated this cycle) still take this path and
+  // avoid zone-3 sequential lag.
+  if (sLedR[0]==sLedR[1] && sLedR[1]==sLedR[2] &&
+      sLedG[0]==sLedG[1] && sLedG[1]==sLedG[2] &&
+      sLedB[0]==sLedB[1] && sLedB[1]==sLedB[2]) {
+    const uint8_t r=sLedR[0], g=sLedG[0], b=sLedB[0];
+    sLedDirty = 0;
+    // Skip if the physical pad already shows this colour.  Deduplicates the
+    // ~1 s periodic state-sync frames from console-esp32 / console-rp2040 that
+    // would otherwise re-assert the pre-blink colour mid-animation and make ON
+    // or OFF blink states invisible.
+    if (sLedLastSentValid && r==sLedLastSentR && g==sLedLastSentG && b==sLedLastSentB) return;
+    sLedLastSentR=r; sLedLastSentG=g; sLedLastSentB=b; sLedLastSentValid=true;
+    toypadLedAll(r, g, b);
+    return;
+  }
+
+  // Mixed colours: send each dirty zone; toypadLedZone() waits for USB free.
+  // Invalidate the dedup cache — zones are now at different colours.
+  sLedLastSentValid = false;
+  for (uint8_t z = 0; z < 3; z++) {
+    if (sLedDirty & (1u << z)) {
+      toypadLedZone(z, sLedR[z], sLedG[z], sLedB[z]);
+    }
+  }
+  sLedDirty = 0;
 }
 
 // ─── Toypad B1/B3 authentication (TEA) ───────────────────────────────────────
@@ -331,19 +392,31 @@ static uint32_t padFigScramble(const uint8_t uid[7], uint8_t count) {
   uint8_t buf[24];  // 7 uid + 17 kCharConstant
   memcpy(buf, uid, 7);
   memcpy(buf + 7, kCharConstant, 17);
-  buf[count * 4 - 1] = 0xaa;  // Ellerbach: constant overwrite, not XOR
+  buf[count * 4 - 1] = 0xaa;  // Physical toypad scramble (Ellerbach): constant 0xaa
+  return padDimRandomize(buf, count);
+}
+
+// RPCS3-style scramble: buf[count*4-1] ^= count  (vs Ellerbach's = 0xaa).
+static uint32_t padFigScrambleRpcs3(const uint8_t uid[7], uint8_t count) {
+  uint8_t buf[24];
+  memcpy(buf, uid, 7);
+  memcpy(buf + 7, kCharConstant, 17);
+  buf[count * 4 - 1] ^= count;  // RPCS3 algorithm
   return padDimRandomize(buf, count);
 }
 
 static void padGenerateFigureKey(const uint8_t uid[7], uint8_t key[16]) {
+  // Physical toy key derivation: 0xaa-constant scramble, little-endian key storage.
+  // padTeaDecryptWithKey reads the key as LE u32 words, so storing LE gives the
+  // correct k0-k3 values that match what was used to encrypt the physical tag.
   const uint32_t s3 = padFigScramble(uid, 3);
   const uint32_t s4 = padFigScramble(uid, 4);
   const uint32_t s5 = padFigScramble(uid, 5);
   const uint32_t s6 = padFigScramble(uid, 6);
-  // Store as little-endian: padTeaDecryptWithKey reads key[n]|(key[n+1]<<8)|...
-  key[0]=(uint8_t)s3; key[1]=(uint8_t)(s3>>8); key[2]=(uint8_t)(s3>>16); key[3]=(uint8_t)(s3>>24);
-  key[4]=(uint8_t)s4; key[5]=(uint8_t)(s4>>8); key[6]=(uint8_t)(s4>>16); key[7]=(uint8_t)(s4>>24);
-  key[8]=(uint8_t)s5; key[9]=(uint8_t)(s5>>8); key[10]=(uint8_t)(s5>>16); key[11]=(uint8_t)(s5>>24);
+  // Store as little-endian u32 words so the LE reads in padTeaDecryptWithKey are correct.
+  key[0]=(uint8_t)s3;  key[1]=(uint8_t)(s3>>8);  key[2]=(uint8_t)(s3>>16); key[3]=(uint8_t)(s3>>24);
+  key[4]=(uint8_t)s4;  key[5]=(uint8_t)(s4>>8);  key[6]=(uint8_t)(s4>>16); key[7]=(uint8_t)(s4>>24);
+  key[8]=(uint8_t)s5;  key[9]=(uint8_t)(s5>>8);  key[10]=(uint8_t)(s5>>16); key[11]=(uint8_t)(s5>>24);
   key[12]=(uint8_t)s6; key[13]=(uint8_t)(s6>>8); key[14]=(uint8_t)(s6>>16); key[15]=(uint8_t)(s6>>24);
 }
 
@@ -362,26 +435,91 @@ static void padTeaDecryptWithKey(const uint8_t* in, uint8_t* out, const uint8_t 
     v0 -= (((v1<<4)+k0)^(v1+sum)^((v1>>5)+k1));
     sum -= kD;
   }
-  out[0]=(uint8_t)v0; out[1]=(uint8_t)(v0>>8); out[2]=(uint8_t)(v0>>16); out[3]=(uint8_t)(v0>>24);
-  out[4]=(uint8_t)v1; out[5]=(uint8_t)(v1>>8); out[6]=(uint8_t)(v1>>16); out[7]=(uint8_t)(v1>>24);
+  out[0]=(uint8_t)v0;       out[1]=(uint8_t)(v0>>8);
+  out[2]=(uint8_t)(v0>>16); out[3]=(uint8_t)(v0>>24);
+  out[4]=(uint8_t)v1;       out[5]=(uint8_t)(v1>>8);
+  out[6]=(uint8_t)(v1>>16); out[7]=(uint8_t)(v1>>24);
 }
 
-// Fetch NFC pages 36-39 from the physical pad, detect vehicle vs character,
-// and decrypt the character ID with the per-figure key.  Blocks up to ~330 ms.
-// Returns 0 if no figure slot matches the given UID.
+// Build a key using the specified scramble function and endianness, then TEA-decrypt
+// pageData[0..7] → dec[0..7].  Returns id0 and id1 (both as LE uint32).
+static void padTryVariant(const uint8_t uid[7], const uint8_t pageData[16],
+                          bool useRpcs3Scramble, bool storeKeyBE,
+                          uint32_t& id0, uint32_t& id1) {
+  uint32_t s[4];
+  for (uint8_t i = 0; i < 4; i++) {
+    s[i] = useRpcs3Scramble ? padFigScrambleRpcs3(uid, (uint8_t)(3+i))
+                            : padFigScramble(uid, (uint8_t)(3+i));
+  }
+  uint8_t key[16];
+  for (uint8_t w = 0; w < 4; w++) {
+    if (storeKeyBE) {
+      key[w*4+0]=(uint8_t)(s[w]>>24); key[w*4+1]=(uint8_t)(s[w]>>16);
+      key[w*4+2]=(uint8_t)(s[w]>>8);  key[w*4+3]=(uint8_t)s[w];
+    } else {
+      key[w*4+0]=(uint8_t)s[w];       key[w*4+1]=(uint8_t)(s[w]>>8);
+      key[w*4+2]=(uint8_t)(s[w]>>16); key[w*4+3]=(uint8_t)(s[w]>>24);
+    }
+  }
+  uint8_t dec[8];
+  padTeaDecryptWithKey(pageData, dec, key);
+  id0 = (uint32_t)dec[0]|((uint32_t)dec[1]<<8)|((uint32_t)dec[2]<<16)|((uint32_t)dec[3]<<24);
+  id1 = (uint32_t)dec[4]|((uint32_t)dec[5]<<8)|((uint32_t)dec[6]<<16)|((uint32_t)dec[7]<<24);
+}
+
+// Send a D2 NFC-page-read command for reader slot 'figIdx' starting at NFC
+// 'page', wait for the pad's response, and copy the 16 result bytes (4 pages)
+// into outBuf.  Returns true on success, false on timeout or send failure.
+// Safe to call from any task other than usbClientTask.
+static bool d2ReadPages(uint8_t figIdx, uint8_t page, uint8_t outBuf[16]) {
+  if (!sUsbDevOpen) return false;
+
+  // Wait for any in-flight OUT transfer (up to 40 ms).
+  for (int i = 0; i < 20 && sUsbOutBusy; i++) vTaskDelay(pdMS_TO_TICKS(2));
+  if (sUsbOutBusy) return false;
+
+  sD2ReplyReady  = false;
+  const uint8_t ctr = sMsgNum++;
+  uint8_t buf[kReportSize] = {};
+  buf[0]=0x55; buf[1]=0x04; buf[2]=0xD2; buf[3]=ctr;
+  buf[4]=figIdx; buf[5]=page;
+  buf[6] = toypadChecksum(buf, 6);
+  Serial.printf("[pad] D2 figIdx=%u page=%u ctr=%u\n", figIdx, page, ctr);
+  if (!sendToToypad(buf)) {
+    Serial.println("[pad] D2 send failed");
+    return false;
+  }
+  sD2WaitCounter = ctr;
+
+  const uint32_t deadline = millis() + 100;
+  while (sD2WaitCounter != 0 && !sD2ReplyReady && millis() < deadline) {
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+  sD2WaitCounter = 0;
+  if (!sD2ReplyReady) {
+    Serial.printf("[pad] D2 timeout figIdx=%u page=%u\n", figIdx, page);
+    return false;
+  }
+  memcpy(outBuf, sD2PageData, 16);
+  return true;
+}
+
+// Fetch the LEGO character/vehicle ID from the physical pad.
 //
-// hintFigIdx: the caller's best guess at which physical reader slot holds this
-// figure (lpZone == padZone-1, so center=0, left=1, right=2).  We try the hint
-// first, then fall back to 0, 1, 2 in order.  TEA id0==id1 validates the match.
+// hintFigIdx: which physical reader slot (lpZone) the toy was detected on.
+// Tried first with up to 3 attempts to handle the "fast zone move" case where
+// the pad fires the "placed" event before its NFC page-read session is ready
+// on the new reader.  TEA id0==id1 validates the correct slot; a mismatch stops
+// retrying immediately (toy isn't on that reader).  Other slots are tried once
+// as a fallback.
 static uint32_t readPhysicalToyId(const uint8_t uid[7], uint8_t hintFigIdx) {
   if (!sUsbDevOpen) return 0;
 
-  // Pre-compute figure key once — same for all figIdx attempts.
   uint8_t figKey[16];
   padGenerateFigureKey(uid, figKey);
 
-  // Try hint first, then 0, 1, 2 (skipping the hint to avoid duplicates).
-  uint8_t order[4];
+  // order[]: hintFigIdx first, then the other two.
+  uint8_t order[3];
   uint8_t cnt = 0;
   order[cnt++] = hintFigIdx;
   for (uint8_t i = 0; i < 3; i++) {
@@ -390,62 +528,61 @@ static uint32_t readPhysicalToyId(const uint8_t uid[7], uint8_t hintFigIdx) {
 
   for (uint8_t oi = 0; oi < cnt; oi++) {
     const uint8_t figIdx = order[oi];
+    // Retry D2 timeouts on the hint slot only; fallback slots get one shot.
+    const uint8_t maxAttempts = (oi == 0) ? 3 : 1;
 
-    // Wait for any in-flight OUT transfer (up to 30 ms) before sending D2.
-    const uint32_t busyDeadline = millis() + 30;
-    while (sUsbOutBusy && millis() < busyDeadline) vTaskDelay(pdMS_TO_TICKS(2));
-    if (sUsbOutBusy) {
-      Serial.println("[pad] D2 skip: out busy");
-      strncpy(sLastD2Status, "d2:busy", sizeof(sLastD2Status));
-      return 0;
-    }
+    for (uint8_t attempt = 0; attempt < maxAttempts; attempt++) {
+      if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(30));
 
-    sD2ReplyReady  = false;
-    const uint8_t ctr = sMsgNum++;
-    uint8_t buf[kReportSize] = {};
-    buf[0]=0x55; buf[1]=0x04; buf[2]=0xD2; buf[3]=ctr;
-    buf[4]=figIdx; buf[5]=36;  // figIdx selects reader slot; page 36 = NFC page 0x24
-    buf[6] = toypadChecksum(buf, 6);
-    Serial.printf("[pad] D2 figIdx=%u ctr=%u\n", figIdx, ctr);
-    if (!sendToToypad(buf)) {
-      Serial.println("[pad] D2 send failed");
-      strncpy(sLastD2Status, "d2:sendfail", sizeof(sLastD2Status));
-      return 0;
-    }
-    sD2WaitCounter = ctr;
+      uint8_t pageData[16];
+      if (!d2ReadPages(figIdx, 36, pageData)) continue;  // timeout → retry
 
-    const uint32_t deadline = millis() + 80;
-    while (sD2WaitCounter != 0 && !sD2ReplyReady && millis() < deadline) {
-      vTaskDelay(pdMS_TO_TICKS(2));
-    }
-    sD2WaitCounter = 0;
-    if (!sD2ReplyReady) {
-      Serial.printf("[pad] D2 timeout figIdx=%u\n", figIdx);
-      continue;  // try next slot
-    }
+      uint8_t dec[8];
+      padTeaDecryptWithKey(pageData, dec, figKey);
+      const uint32_t id0 = (uint32_t)dec[0] | ((uint32_t)dec[1]<<8) |
+                           ((uint32_t)dec[2]<<16) | ((uint32_t)dec[3]<<24);
+      const uint32_t id1 = (uint32_t)dec[4] | ((uint32_t)dec[5]<<8) |
+                           ((uint32_t)dec[6]<<16) | ((uint32_t)dec[7]<<24);
+      Serial.printf("[pad] D2 figIdx=%u id0=%04lx id1=%04lx%s\n",
+                    figIdx, (unsigned long)id0, (unsigned long)id1,
+                    id0==id1 ? " OK" : " mm");
 
-    // TEA decrypt pages 36-37 (bytes 0-7).  Valid data has id0 == id1.
-    uint8_t dec[8];
-    padTeaDecryptWithKey(sD2PageData, dec, figKey);
-    const uint32_t id0 = (uint32_t)dec[0] | ((uint32_t)dec[1]<<8) |
-                         ((uint32_t)dec[2]<<16) | ((uint32_t)dec[3]<<24);
-    const uint32_t id1 = (uint32_t)dec[4] | ((uint32_t)dec[5]<<8) |
-                         ((uint32_t)dec[6]<<16) | ((uint32_t)dec[7]<<24);
-    Serial.printf("[pad] D2 figIdx=%u id0=0x%04lx id1=0x%04lx%s\n",
-                  figIdx, (unsigned long)id0, (unsigned long)id1,
-                  id0==id1 ? " OK" : " mm");
-    if (id0 != id1) continue;  // wrong reader slot — try next
+      // Diagnostic: try all 4 algorithm variants on this pageData.
+      // Runs regardless of id0==id1 so we always get output.
+      // Format: "aa-le:ID= xr-le:ID= aa-be:ID! xr-be:ID="
+      if (oi == 0 && attempt == 0) {  // only on the first attempt of the hint slot
+        struct { bool rpcs3; bool be; const char* tag; } variants[4] = {
+          {false, false, "aa-le"},
+          {true,  false, "xr-le"},
+          {false, true,  "aa-be"},
+          {true,  true,  "xr-be"},
+        };
+        char dbg[160]; int dpos = 0;
+        for (int v = 0; v < 4; v++) {
+          uint32_t vi0, vi1;
+          padTryVariant(uid, pageData, variants[v].rpcs3, variants[v].be, vi0, vi1);
+          dpos += snprintf(dbg+dpos, (int)sizeof(dbg)-dpos,
+                           "%s:%lx%c ",
+                           variants[v].tag, (unsigned long)vi0,
+                           vi0==vi1 ? '=' : '!');
+          if (dpos >= (int)sizeof(dbg)-1) break;
+        }
+        strlcpy(sLastD2Debug, dbg, sizeof(sLastD2Debug));
+        Serial.printf("[pad] D2 dbg: %s\n", sLastD2Debug);
+      }
 
-    // Matched.  Check vehicle marker: page 38 bytes 8-11 == {0x00,0x01,0x00,0x00}.
-    const bool isVehicle = (sD2PageData[8]==0x00 && sD2PageData[9]==0x01 &&
-                            sD2PageData[10]==0x00 && sD2PageData[11]==0x00);
-    if (isVehicle) {
-      Serial.printf("[pad] D2 vehicle id=0x%04lx figIdx=%u\n", (unsigned long)id0, figIdx);
-      snprintf(sLastD2Status, sizeof(sLastD2Status), "d2:veh:%04lx fi=%u", (unsigned long)id0, figIdx);
-    } else {
-      snprintf(sLastD2Status, sizeof(sLastD2Status), "d2:ok:%04lx fi=%u", (unsigned long)id0, figIdx);
+      if (id0 != id1) break;  // TEA mismatch → wrong slot, stop retrying
+
+      const bool isVehicle = (pageData[8]==0x00 && pageData[9]==0x01 &&
+                              pageData[10]==0x00 && pageData[11]==0x00);
+      if (isVehicle)
+        snprintf(sLastD2Status, sizeof(sLastD2Status),
+                 "d2:veh:%04lx fi=%u", (unsigned long)id0, figIdx);
+      else
+        snprintf(sLastD2Status, sizeof(sLastD2Status),
+                 "d2:ok:%04lx fi=%u", (unsigned long)id0, figIdx);
+      return id0;
     }
-    return id0;
   }
 
   snprintf(sLastD2Status, sizeof(sLastD2Status), "d2:mm");
@@ -777,45 +914,56 @@ static void sendHello() {
 
 // ─── Tag forwarding ───────────────────────────────────────────────────────────
 #if PAD_USB_HOST
-// LP slot pools per zone.  The physical pad sends zone + UID; we assign the
-// first free slot from the zone's pool and track toys by UID.
-// Matches slotToLpZone() in console-rp2040: slot2=center, {1,4,5}=left, {3,6,7}=right.
-// padZone: 1=center (lpZone 0), 2=left (lpZone 1), 3=right (lpZone 2).
-static const uint8_t kZoneSlots[3][3] = {
-  {2, 0, 0},    // lpZone 0 (center): slot 2 only
-  {1, 4, 5},    // lpZone 1 (left):   slots 1, 4, 5
-  {3, 6, 7},    // lpZone 2 (right):  slots 3, 6, 7
-};
-static const uint8_t kZoneSlotCount[3] = {1, 3, 3};
-
 static void forwardTagEvent(const TagEvent& evt) {
   if (!paired) return;
-  const uint8_t z      = evt.lpZone;
-  const uint8_t nSlots = kZoneSlotCount[z];
+  const uint8_t z = evt.lpZone;  // 0=center, 1=left, 2=right
 
   if (evt.placed) {
-    // Ignore if this UID is already tracked in this zone (duplicate event).
-    for (uint8_t i = 0; i < nSlots; i++) {
-      const uint8_t s = kZoneSlots[z][i];
-      if (s && sSlotOccupied[s-1] && memcmp(sSlotUid[s-1], evt.uid, 7) == 0) return;
+    // 1. Ignore if this UID is already tracked in THIS zone (duplicate event).
+    for (uint8_t si = 0; si < 7; si++) {
+      if (sSlotOccupied[si] && sSlotZone[si] == z &&
+          memcmp(sSlotUid[si], evt.uid, 7) == 0) return;
     }
-    // Assign the first free slot in the zone's pool.
+    // 2. Fast-move: UID already tracked in a DIFFERENT zone (PLACE before REMOVE).
+    //    Keep the same slot so the game sees a zone-move, not a new figure.
+    //    Update sSlotZone so the subsequent stale REMOVE (from the old zone) is ignored.
+    //    Send TAG_SET with the new zone; console-rp2040's zoneMoved logic emits
+    //    REMOVE(oldPad, slot) + PLACE(newPad, slot) with the same figIndex.
+    for (uint8_t si = 0; si < 7; si++) {
+      if (sSlotOccupied[si] && sSlotZone[si] != z &&
+          memcmp(sSlotUid[si], evt.uid, 7) == 0) {
+        const uint8_t slot   = si + 1;
+        const uint8_t oldZ   = sSlotZone[si];
+        const uint32_t toyId = sSlotToyId[si];
+        sSlotZone[si] = z;
+        uint8_t payload[6];
+        payload[0] = slot; payload[1] = z;
+        payload[2] = (uint8_t)toyId;         payload[3] = (uint8_t)(toyId >> 8);
+        payload[4] = (uint8_t)(toyId >> 16); payload[5] = (uint8_t)(toyId >> 24);
+        sendFrame(LP_MSG_TAG_SET, payload, 6, true);
+        sLastLedCmdMs = millis();
+        Serial.printf("[pad] move z%u->z%u slot=%u uid=%02x%02x%02x%02x\n",
+                      oldZ, z, slot,
+                      evt.uid[0], evt.uid[1], evt.uid[2], evt.uid[3]);
+        return;
+      }
+    }
+    // 3. New toy: find first free global slot (1-7).
     uint8_t slot = 0;
-    for (uint8_t i = 0; i < nSlots; i++) {
-      const uint8_t s = kZoneSlots[z][i];
-      if (s && !sSlotOccupied[s-1]) { slot = s; break; }
+    for (uint8_t si = 0; si < 7; si++) {
+      if (!sSlotOccupied[si]) { slot = si + 1; break; }
     }
     if (slot == 0) {
-      Serial.printf("[pad] zone %u full, dropping uid=%02x%02x%02x%02x\n",
-                    z, evt.uid[0], evt.uid[1], evt.uid[2], evt.uid[3]);
+      Serial.printf("[pad] all slots full, dropping uid=%02x%02x%02x%02x\n",
+                    evt.uid[0], evt.uid[1], evt.uid[2], evt.uid[3]);
       return;
     }
     // Read real LEGO character ID from NFC page 36 of the physical figure.
     uint32_t toyId = readPhysicalToyId(evt.uid, evt.lpZone);
     if (toyId == 0) {
-      // Fallback: UID bytes — game won’t recognise the toy but at least shows it.
-      toyId = (uint32_t)evt.uid[0] | ((uint32_t)evt.uid[1]<<8) |
-              ((uint32_t)evt.uid[2]<<16) | ((uint32_t)evt.uid[3]<<24);
+      // Fallback: UID bytes — game won't recognise the toy but at least shows it.
+      toyId = (uint32_t)evt.uid[0] | ((uint32_t)evt.uid[1] << 8) |
+              ((uint32_t)evt.uid[2] << 16) | ((uint32_t)evt.uid[3] << 24);
       Serial.printf("[pad] placed z=%u slot=%u uid=%02x%02x%02x%02x (UID fallback)\n",
                     z, slot, evt.uid[0], evt.uid[1], evt.uid[2], evt.uid[3]);
     } else {
@@ -823,28 +971,39 @@ static void forwardTagEvent(const TagEvent& evt) {
                     z, slot, evt.uid[0], evt.uid[1], evt.uid[2], evt.uid[3],
                     (unsigned long)toyId);
     }
-    sSlotOccupied[slot-1] = true;
-    memcpy(sSlotUid[slot-1], evt.uid, 7);
-    sSlotToyId[slot-1] = toyId;
-    uint8_t payload[5];
-    payload[0]=slot; payload[1]=(uint8_t)toyId; payload[2]=(uint8_t)(toyId>>8);
-    payload[3]=(uint8_t)(toyId>>16); payload[4]=(uint8_t)(toyId>>24);
-    sendFrame(LP_MSG_TAG_SET, payload, 5, true);
+    sSlotOccupied[slot - 1] = true;
+    memcpy(sSlotUid[slot - 1], evt.uid, 7);
+    sSlotToyId[slot - 1] = toyId;
+    sSlotZone[slot - 1]  = z;
+    uint8_t payload[6];
+    payload[0] = slot; payload[1] = z;
+    payload[2] = (uint8_t)toyId;         payload[3] = (uint8_t)(toyId >> 8);
+    payload[4] = (uint8_t)(toyId >> 16); payload[5] = (uint8_t)(toyId >> 24);
+    sendFrame(LP_MSG_TAG_SET, payload, 6, true);
+    sLastLedCmdMs = millis();  // tag activity = game is active; suppress standby green
     // Report D2 outcome over LP debug so it appears in console output.
     sendFrame(LP_MSG_DEBUG, (const uint8_t*)sLastD2Status, strlen(sLastD2Status), false);
+    // Send full 4-variant diagnostic (prefixed "aa-le:" so console can identify it).
+    if (sLastD2Debug[0]) {
+      const uint8_t dlen = (uint8_t)strnlen(sLastD2Debug, LP_MAX_PAYLOAD);
+      sendFrame(LP_MSG_DEBUG, (const uint8_t*)sLastD2Debug, dlen, false);
+    }
   } else {
-    // Find the slot holding this UID in this zone.
+    // REMOVE: find slot with matching UID AND matching zone.
+    // Zone check prevents false removal when the toy already moved to a new zone
+    // and a stale REMOVE arrives from the previous zone.
     uint8_t slot = 0;
-    for (uint8_t i = 0; i < nSlots; i++) {
-      const uint8_t s = kZoneSlots[z][i];
-      if (s && sSlotOccupied[s-1] && memcmp(sSlotUid[s-1], evt.uid, 7) == 0) {
-        slot = s; break;
+    for (uint8_t si = 0; si < 7; si++) {
+      if (sSlotOccupied[si] && sSlotZone[si] == z &&
+          memcmp(sSlotUid[si], evt.uid, 7) == 0) {
+        slot = si + 1; break;
       }
     }
-    if (slot == 0) return;  // not tracked — ignore spurious removal
-    sSlotOccupied[slot-1] = false;
+    if (slot == 0) return;  // UID not in this zone -> stale REMOVE (toy moved), ignore
+    sSlotOccupied[slot - 1] = false;
     const uint8_t payload[1] = {slot};
     sendFrame(LP_MSG_TAG_CLEAR, payload, 1, true);
+    sLastLedCmdMs = millis();  // tag activity = game is active; suppress standby green
     Serial.printf("[pad] removed z=%u slot=%u uid=%02x%02x%02x%02x\n",
                   z, slot, evt.uid[0], evt.uid[1], evt.uid[2], evt.uid[3]);
   }
@@ -981,6 +1140,11 @@ static const char kPadPortalPage[] = R"HTML(
       Debug via USB serial at 115200 baud &mdash; press any key for menu.<br>
       <code>s</code>&nbsp;state &nbsp;<code>p N</code>&nbsp;place &nbsp;<code>r N</code>&nbsp;remove &nbsp;<code>f text</code>&nbsp;search
     </div>
+    <div class="card" style="font-size:.8rem">
+      <h3>NFC Decode Debug</h3>
+      <div id="d2dbg" class="muted">Place a physical toy to see results&hellip;</div>
+      <div class="muted" style="margin-top:.4rem">aa-le=Ellerbach/LE&nbsp; xr-le=RPCS3scr/LE&nbsp; aa-be=Ellerbach/BE&nbsp; xr-be=RPCS3scr/BE<br>(= means id0==id1 valid; ! means mismatch)</div>
+    </div>
   </div>
   <script>
     var catalog=null;
@@ -1024,6 +1188,7 @@ static const char kPadPortalPage[] = R"HTML(
           }).join('');
         }
         document.getElementById('wifi').textContent='SSID: '+d.ssid+' | IP: '+d.ip;
+        if(d.d2dbg) document.getElementById('d2dbg').textContent=d.d2dbg;
       }catch(e){document.getElementById('sub').textContent='Error: '+e.message;}
     }
     refresh();
@@ -1068,7 +1233,6 @@ static void handlePadState() {
   // Current slot occupancy (USB-host builds only).
 #if PAD_USB_HOST
   json += ",\"slots\":[";
-  static const uint8_t kSltZone[7] = {1,0,2,1,1,2,2};  // slot1..7 → lpZone 0-2
   bool firstSlot = true;
   for (uint8_t si = 0; si < 7; si++) {
     if (!sSlotOccupied[si]) continue;
@@ -1076,13 +1240,17 @@ static void handlePadState() {
     json += "{\"slot\":";
     json += (uint32_t)(si + 1);
     json += ",\"zone\":";
-    json += (uint32_t)kSltZone[si];
+    json += (uint32_t)sSlotZone[si];  // dynamic zone from global pool
     json += ",\"toyId\":";
     json += sSlotToyId[si];
     json += "}";
     firstSlot = false;
   }
   json += "]";
+  // Diagnostic: last physical-toy D2 decryption results for all 4 variants.
+  json += ",\"d2dbg\":\"";
+  json += sLastD2Debug;
+  json += "\"";
 #else
   json += ",\"slots\":[]";
 #endif
@@ -1234,6 +1402,14 @@ static uint8_t searchCatalog(const char* query, CatalogMatch* out, uint8_t maxOu
 }
 
 // ─── Virtual toy helpers ──────────────────────────────────────────────────────
+// For virtual toys the zone is derived from the slot number using the same
+// mapping as slotToLpZone() in console-rp2040.
+static uint8_t slotToLpZoneLocal(uint8_t slot) {
+  if (slot == 2) return 0;                       // center
+  if (slot == 1 || slot == 4 || slot == 5) return 1;  // left
+  return 2;                                      // right (slots 3, 6, 7)
+}
+
 static void virtualPlace(uint8_t slot, uint32_t toyId) {
   if (slot < 1 || slot > 7) return;
   sVirtualOccupied[slot - 1] = true;
@@ -1242,10 +1418,11 @@ static void virtualPlace(uint8_t slot, uint32_t toyId) {
     Serial.println("  [not paired] cached — will sync once paired");
     return;
   }
-  uint8_t p[5] = {slot,
+  const uint8_t zone = slotToLpZoneLocal(slot);
+  uint8_t p[6] = {slot, zone,
     (uint8_t)toyId, (uint8_t)(toyId >> 8),
     (uint8_t)(toyId >> 16), (uint8_t)(toyId >> 24)};
-  sendFrame(LP_MSG_TAG_SET, p, 5, true);
+  sendFrame(LP_MSG_TAG_SET, p, 6, true);
   Serial.printf("  Placed ID 0x%04X on slot %u\n", toyId, slot);
 }
 
@@ -1567,11 +1744,30 @@ static void processTcpIn(uint32_t now) {
       const uint8_t g    = frame.payload[2];
       const uint8_t b    = frame.payload[3];
       sLastLedCmdMs = millis();  // game is active
+      // Buffer zone colour; flush as soon as all 3 zones are updated so that
+      // ON and OFF batches queued back-to-back in the same TCP read are each
+      // sent to the physical pad rather than the first being overwritten.
+      // Coalesces zone-0/1/2 bursts into a single toypadLedAll() when all zones
+      // share the same colour (eliminates zone-3 sync skew).
+#if PAD_USB_HOST
+      if (zone == 0xff) {
+        sLedR[0]=r; sLedG[0]=g; sLedB[0]=b;
+        sLedR[1]=r; sLedG[1]=g; sLedB[1]=b;
+        sLedR[2]=r; sLedG[2]=g; sLedB[2]=b;
+        sLedDirty = 0x07;
+        flushPendingLed();   // zone=0xff sets all 3 at once → flush immediately
+      } else if (zone < 3) {
+        sLedR[zone]=r; sLedG[zone]=g; sLedB[zone]=b;
+        sLedDirty |= (1u << zone);
+        if (sLedDirty == 0x07) flushPendingLed();  // all 3 zones now updated → flush
+      }
+#else
       if (zone == 0xff) {
         toypadLedAll(r, g, b);
       } else {
         toypadLedZone(zone, r, g, b);
       }
+#endif
       continue;
     }
 
@@ -1623,6 +1819,9 @@ void loop() {
 
   serviceFactoryReset();
   processTcpIn(now);
+#if PAD_USB_HOST
+  flushPendingLed();
+#endif
 
   // Retry pending LP frame
   if (pending.active && (now - pending.lastSentMs) >= kRetryMs) {
@@ -1731,28 +1930,7 @@ void loop() {
         connState  = CONN_BLINK_FAIL;
         startBlink(kBlinkCount);
       }
-      // Standby green: hold the physical pad green while no game is active.
-      // When the game goes quiet for kLedIdleMs, revert to green.
-      // Refresh every 5 s while idle so a power-cycled pad recovers automatically.
-      {
-        const bool gameIdle = (sLastLedCmdMs == 0 ||
-                               (now - sLastLedCmdMs) >= kLedIdleMs);
-        if (gameIdle && sLastLedCmdMs != 0) {
-          sLastLedCmdMs = 0;  // transition: game gone quiet
-        }
-        static uint32_t sStandbyRefreshMs = 0;
-        if (gameIdle) {
-#if PAD_USB_HOST
-          if (sUsbDevOpen &&
-              (sStandbyRefreshMs == 0 || (now - sStandbyRefreshMs) >= 5000u)) {
-            sStandbyRefreshMs = now;
-            toypadLedAll(kGR, kGG, kGB);
-          }
-#endif
-        } else {
-          sStandbyRefreshMs = 0;  // reset so refresh fires immediately on next idle
-        }
-      }
+
 #if PAD_USB_HOST
       // Drain physical tag event queue
       {
@@ -1772,10 +1950,10 @@ void loop() {
           for (uint8_t si = 0; si < 7; si++) {
             const uint8_t s = si + 1;
             if (sSlotOccupied[si]) {
-              uint8_t p[5] = {s,
+              uint8_t p[6] = {s, sSlotZone[si],
                 (uint8_t)sSlotToyId[si],        (uint8_t)(sSlotToyId[si] >> 8),
                 (uint8_t)(sSlotToyId[si] >> 16), (uint8_t)(sSlotToyId[si] >> 24)};
-              sendFrame(LP_MSG_TAG_SET, p, 5, false);
+              sendFrame(LP_MSG_TAG_SET, p, 6, false);
             } else {
               const uint8_t p[1] = {s};
               sendFrame(LP_MSG_TAG_CLEAR, p, 1, false);
@@ -1797,9 +1975,10 @@ void loop() {
 #endif
             if (sVirtualOccupied[s - 1]) {
               const uint32_t id = sVirtualToyId[s - 1];
-              uint8_t p[5] = {s, (uint8_t)id, (uint8_t)(id >> 8),
+              const uint8_t zone = slotToLpZoneLocal(s);
+              uint8_t p[6] = {s, zone, (uint8_t)id, (uint8_t)(id >> 8),
                               (uint8_t)(id >> 16), (uint8_t)(id >> 24)};
-              sendFrame(LP_MSG_TAG_SET, p, 5, false);
+              sendFrame(LP_MSG_TAG_SET, p, 6, false);
             }
             // Don't send TAG_CLEAR for empty virtual slots — same reason as above.
           }

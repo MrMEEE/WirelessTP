@@ -196,9 +196,15 @@ static inline lp_parse_result_t lp_stream_push(lp_stream_parser_t* parser, uint8
   return LP_PARSE_NONE;
 }
 
-// TAG_SET payload
-// [0] zone_id (0 center, 1 left, 2 right)
-// [1..4] toy_id_le (32-bit for now; expand later if required)
+// TAG_SET payload (6 bytes)
+// [0] slot      (1-7, global across all zones; stable for the toy's lifetime on pad)
+// [1] zone      (0=center, 1=left, 2=right)
+// [2..5] toy_id_le (32-bit)
+//
+// When the same toy moves to a different zone, pad-esp32 reuses the same slot
+// and sends a new TAG_SET with updated zone.  console-rp2040 detects the zone
+// change and emits REMOVE(oldZone, figIdx) + PLACE(newZone, figIdx) so the
+// game sees a move rather than two separate toys.
 
 // LED_CMD payload
 // [0] zone_id

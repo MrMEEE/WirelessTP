@@ -285,6 +285,7 @@ struct ToyPadState {
   uint8_t slotUid[7][kToyUidSize];  // per web-UI slot (index = slot-1)
   bool slotUidValid[7];
   uint32_t slotToyId[7];  // toy ID per slot (index = slot-1, slots 1-7)
+  uint8_t slotZone[7];    // LP zone (0=center,1=left,2=right) of each slot
 };
 
 struct ToyInPacketQueue {
@@ -293,6 +294,19 @@ struct ToyInPacketQueue {
   uint8_t tail;
   uint8_t count;
 };
+
+// Per-slot NFC write cache.  The game writes vehicle upgrade/initialization
+// data via D3 to pages across the full NTAG213 user-data range (pages 4-44).
+// Vehicles write to early pages (4-19) as well as the upper range (20-44),
+// so the cache must cover all user-writable pages.  Pages 0-3 are UID/lock
+// and are never written by the game.
+// We cache all D3 writes and serve them back on D2 reads so that vehicle
+// upgrades persist for the session.
+static const uint8_t kPageCacheMin   = 4;
+static const uint8_t kPageCacheMax   = 44;  // inclusive
+static const uint8_t kPageCacheCount = kPageCacheMax - kPageCacheMin + 1;  // 41
+struct PageCacheEntry { bool valid; uint8_t data[4]; };
+static PageCacheEntry sPageCache[7][kPageCacheCount];  // [slot-1][page - kPageCacheMin]
 
 lp_stream_parser_t uartParser;
 uint8_t seqCounter = 0;
@@ -708,6 +722,11 @@ static void buildSyntheticFigurePage16(uint8_t slot, uint8_t startPage, uint8_t 
   for (uint8_t i = 0; i < 4; i++) {
     const uint8_t page = startPage + i;
     uint8_t* pp = &out[i * 4];
+    // Check write cache first (D3 writes take precedence over synthetic data).
+    if (page >= kPageCacheMin && page <= kPageCacheMax) {
+      const PageCacheEntry& e = sPageCache[slot - 1][page - kPageCacheMin];
+      if (e.valid) { memcpy(pp, e.data, 4); continue; }
+    }
     switch (page) {
       case 0:
         pp[0]=uid[0]; pp[1]=uid[1]; pp[2]=uid[2];
@@ -914,9 +933,24 @@ static void handleToyCommand(const ToyPadOutPacket& p) {
     case TOY_CMD_D3: {
       // Block write: game writes 4 bytes to a page. Acknowledge with [0x00].
       // Reply format: [0x00] = 1-byte payload → packet[1]=0x02
+      // Cache the write so D2 reads return consistent data for the session.
       const uint8_t reply[1] = {0x00};
       enqueueToyReply(p.counter, reply, 1);
-      debugPrintf("d3 write");
+      if (p.argsLen >= 6) {
+        const uint8_t figIndex = p.args[0];
+        const uint8_t page     = p.args[1];
+        if (figIndex >= 1 && figIndex <= 7 &&
+            page >= kPageCacheMin && page <= kPageCacheMax) {
+          PageCacheEntry& e = sPageCache[figIndex - 1][page - kPageCacheMin];
+          e.valid = true;
+          memcpy(e.data, &p.args[2], 4);
+          debugPrintf("d3 idx=%u pg=%u", figIndex, page);
+        } else {
+          debugPrintf("d3 idx=%u pg=%u (skip)", p.args[0], p.args[1]);
+        }
+      } else {
+        debugPrintf("d3 write short");
+      }
       break;
     }
     case TOY_CMD_D4: {
@@ -995,40 +1029,54 @@ static void handleFrame(const lp_frame_t& frame) {
       debugPrintf("link hello");
       break;
     case LP_MSG_TAG_SET:
-      if (frame.header.length == 5) {
-        const uint8_t slot  = frame.payload[0];  // web-UI slot (1-7)
-        const uint32_t toyId = (uint32_t)frame.payload[1] |
-                               ((uint32_t)frame.payload[2] << 8) |
-                               ((uint32_t)frame.payload[3] << 16) |
-                               ((uint32_t)frame.payload[4] << 24);
-        const uint8_t zone    = slotToLpZone(slot);
-        const uint8_t pad     = lpZoneToToyZone(zone);  // 1=center,2=left,3=right
+      if (frame.header.length == 6) {
+        const uint8_t slot   = frame.payload[0];  // global slot (1-7)
+        const uint8_t zone   = frame.payload[1];  // LP zone (0=center,1=left,2=right)
+        const uint32_t toyId = (uint32_t)frame.payload[2] |
+                               ((uint32_t)frame.payload[3] << 8) |
+                               ((uint32_t)frame.payload[4] << 16) |
+                               ((uint32_t)frame.payload[5] << 24);
+        const uint8_t pad = lpZoneToToyZone(zone);  // 1=center,2=left,3=right
         uint8_t uid[kToyUidSize];
         buildToyUidFromToyId(toyId, slot, uid);
 
         if (slot >= 1 && slot <= 7) {
-          const bool sameId = toyState.slotUidValid[slot - 1]
-                             && toyState.slotToyId[slot - 1] == toyId;
+          const bool occupied  = toyState.slotUidValid[slot - 1];
+          const bool sameId    = occupied && toyState.slotToyId[slot - 1] == toyId;
+          const uint8_t oldZone = toyState.slotZone[slot - 1];  // capture before update
+          const bool zoneMoved  = sameId && (oldZone != zone);
+
           toyState.slotToyId[slot - 1]  = toyId;
+          toyState.slotZone[slot - 1]   = zone;
           memcpy(toyState.slotUid[slot - 1], uid, kToyUidSize);
           toyState.slotUidValid[slot - 1] = true;
-          if (!sameId) {
+
+          if (zoneMoved) {
+            // Toy moved between zones: emit REMOVE(oldZone) + PLACE(newZone) with
+            // the SAME figIndex (slot) so the game sees a move, not a new toy.
+            const uint8_t oldPad = lpZoneToToyZone(oldZone);
+            enqueueToyTagEvent(oldPad, slot, kToyTagActionRemoved, uid);
+            enqueueToyTagEvent(pad, slot, kToyTagActionPlaced, uid);
+            debugPrintf("TAG_SET MOVE slot=%u z%u->z%u", slot, oldZone, zone);
+          } else if (!sameId) {
             enqueueToyTagEvent(pad, slot, kToyTagActionPlaced, uid);
             debugPrintf("TAG_SET slot=%u zone=%u id=%lx", slot, zone, (unsigned long)toyId);
           }
+          // else: same id + same zone (periodic re-sync) -> no-op
         }
       }
       break;
     case LP_MSG_TAG_CLEAR:
       if (frame.header.length >= 1) {
-        const uint8_t slot  = frame.payload[0];  // web-UI slot (1-7)
-        const uint8_t zone  = slotToLpZone(slot);
-        const uint8_t pad   = lpZoneToToyZone(zone);
-        uint8_t uid[kToyUidSize] = {0};
+        const uint8_t slot  = frame.payload[0];  // global slot (1-7)
         if (slot >= 1 && slot <= 7) {
           if (toyState.slotUidValid[slot - 1]) {
+            const uint8_t zone = toyState.slotZone[slot - 1];  // use tracked zone
+            const uint8_t pad  = lpZoneToToyZone(zone);
+            uint8_t uid[kToyUidSize] = {0};
             memcpy(uid, toyState.slotUid[slot - 1], kToyUidSize);
             toyState.slotUidValid[slot - 1] = false;
+            memset(sPageCache[slot - 1], 0, sizeof(sPageCache[slot - 1]));
             enqueueToyTagEvent(pad, slot, kToyTagActionRemoved, uid);
             debugPrintf("TAG_CLEAR slot=%u", slot);
           }
@@ -1041,7 +1089,8 @@ static void handleFrame(const lp_frame_t& frame) {
           uint8_t uid[kToyUidSize] = {0};
           memcpy(uid, toyState.slotUid[s - 1], kToyUidSize);
           toyState.slotUidValid[s - 1] = false;
-          const uint8_t z = slotToLpZone(s);
+          memset(sPageCache[s - 1], 0, sizeof(sPageCache[s - 1]));
+          const uint8_t z = toyState.slotZone[s - 1];  // use tracked zone
           enqueueToyTagEvent(lpZoneToToyZone(z), s, kToyTagActionRemoved, uid);
         }
         debugPrintf("TAG_CLEAR all");

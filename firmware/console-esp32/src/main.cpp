@@ -46,6 +46,7 @@ typedef struct {
   uint32_t toyId;
   char label[24];
   uint8_t toyType;
+  uint8_t zone;           // LP zone: 0=center, 1=left, 2=right
   bool fromToybox;
   uint8_t toyboxOriginIndex;
 } SlotState;
@@ -78,6 +79,7 @@ uint32_t padLastRxMs = 0;  // millis() of last successfully-parsed LP frame from
 uint32_t lastHelloMs = 0;
 uint32_t lastStateSyncMs = 0;
 uint32_t lastDebugHeartbeatMs = 0;
+static char sPadD2Debug[LP_MAX_PAYLOAD + 1] = "";  // last NFC-variant diagnostic from pad
 String apSsid;
 uint32_t sharedSecret = 0;
 RuntimeMode runtimeMode = MODE_EMULATOR;
@@ -192,7 +194,7 @@ static const char kPortalPage[] = R"HTML(
       </div>
     </div>
     <div class="card" id="installInfo" style="display:none;"><div class="install-note" id="installNote"></div></div>
-    <div class="card"><div class="status-row" id="statusRow"></div></div>
+    <div class="card"><div class="status-row" id="statusRow"></div><div id="d2dbg" style="font-size:.78rem;color:#94a3b8;margin-top:.4rem;font-family:monospace"></div></div>
     <div class="card"><h3 style="margin-top:0">The Toy Pad (7 slots)</h3><div class="pad-grid" id="padGrid"></div></div>
     <div class="layout">
       <div class="stack">
@@ -489,6 +491,8 @@ static const char kPortalPage[] = R"HTML(
         const r = await fetch("/api/state", { cache:"no-store" });
         const data = await r.json();
         render(data);
+        const dbgEl = document.getElementById('d2dbg');
+        if (dbgEl && data.d2dbg) dbgEl.textContent = 'NFC dbg: ' + data.d2dbg;
       } finally {
         refreshInFlight = false;
       }
@@ -672,6 +676,7 @@ static void clearSlotState(uint8_t slotIndex) {
   padSlots[slotIndex].toyId = 0;
   padSlots[slotIndex].toyType = TOY_UNKNOWN;
   padSlots[slotIndex].label[0] = '\0';
+  padSlots[slotIndex].zone = slotToLpZone(slotIndex + 1);
   padSlots[slotIndex].fromToybox = false;
   padSlots[slotIndex].toyboxOriginIndex = 0xff;
 }
@@ -684,6 +689,9 @@ static void setSlotState(uint8_t slotIndex, uint32_t toyId, const char* label, u
   padSlots[slotIndex].occupied = true;
   padSlots[slotIndex].toyId = toyId;
   padSlots[slotIndex].toyType = toyType;
+  // zone is set separately (by observeFrameState for physical toys, or by
+  // handleApiSlotPlace for virtual toys). Default to slot-derived value only
+  // if never set (zone field was zeroed at init).
   padSlots[slotIndex].fromToybox = fromToybox;
   padSlots[slotIndex].toyboxOriginIndex = toyboxOriginIndex;
   if (label != NULL) {
@@ -738,7 +746,9 @@ static bool catalogLookupById(uint32_t toyId, char* nameBuf, size_t nameBufLen, 
   return false;
 }
 
-static void observeFrameState(const lp_frame_t& frame) {
+// fromPad: true when the frame arrived via TCP from the pad-esp32.
+//          false when it arrived via UART from the RP2040.
+static void observeFrameState(const lp_frame_t& frame, bool fromPad) {
   if (frame.header.type == LP_MSG_LED_CMD && frame.header.length >= 4) {
     const uint8_t zone = frame.payload[0];
     const uint8_t r = frame.payload[1];
@@ -754,21 +764,39 @@ static void observeFrameState(const lp_frame_t& frame) {
     return;
   }
 
-  if (frame.header.type == LP_MSG_TAG_SET && frame.header.length >= 5) {
+  // TAG_SET from pad uses 6-byte payload: [slot, zone, toyId[4 LE]].
+  // TAG_SET from RP2040 uses 5-byte payload: [slot, toyId[4 LE]] (no zone).
+  // In emulator mode the console owns slot state; ignore tag events from the pad
+  // so its periodic TAG_CLEAR syncs don't wipe virtual toys.
+  if (frame.header.type == LP_MSG_TAG_SET) {
+    if (fromPad && runtimeMode == MODE_EMULATOR) return;  // console owns state
+    const uint8_t minLen = fromPad ? 6 : 5;
+    if (frame.header.length < minLen) return;
     const uint8_t slotNum = frame.payload[0];
     if (slotNum >= 1 && slotNum <= kSlotCount) {
-      const uint32_t toyId = readU32Le(&frame.payload[1]);
+      // Pad: payload[1]=zone, payload[2..5]=toyId. UART: payload[1..4]=toyId.
+      const uint8_t toyOff = fromPad ? 2 : 1;
+      const uint32_t toyId = readU32Le(&frame.payload[toyOff]);
       char name[24] = {};
       uint8_t toyType = TOY_UNKNOWN;
       if (!catalogLookupById(toyId, name, sizeof(name), &toyType)) {
         snprintf(name, sizeof(name), "Toy %lu", (unsigned long)toyId);
       }
       setSlotState(slotNum - 1, toyId, name, toyType);
+      // Save the actual zone reported by the pad so kStateSyncMs resync uses
+      // the correct zone rather than the slot-derived fallback.
+      if (fromPad) {
+        padSlots[slotNum - 1].zone = frame.payload[1];
+      } else {
+        padSlots[slotNum - 1].zone = slotToLpZone(slotNum);
+      }
     }
     return;
   }
 
   if (frame.header.type == LP_MSG_TAG_CLEAR && frame.header.length >= 1) {
+    // In emulator mode, pad TAG_CLEARs (periodic sync) must not wipe virtual toys.
+    if (fromPad && runtimeMode == MODE_EMULATOR) return;
     const uint8_t slotNum = frame.payload[0];
     if (slotNum >= 1 && slotNum <= kSlotCount) {
       clearSlotState(slotNum - 1);
@@ -787,9 +815,16 @@ static uint8_t slotToLpZone(uint8_t slotNum) {
 }
 
 static bool sendTagSet(uint8_t slot, uint32_t toyId) {
-  uint8_t payload[5];
-  payload[0] = slot;  // slot (1-7) lets the RP2040 assign a unique figure index
-  writeU32Le(&payload[1], toyId);
+  // RP2040 handler requires exactly 6 bytes: [slot, zone, toyId[4 LE]].
+  // Use the stored zone for this slot (set by observeFrameState for physical
+  // toys, or by handleApiSlotPlace for virtual toys) so the RP2040 always
+  // sees a consistent zone and never emits a spurious REMOVE+PLACE move event.
+  uint8_t payload[6];
+  payload[0] = slot;
+  payload[1] = (slot >= 1 && slot <= kSlotCount)
+                   ? padSlots[slot - 1].zone
+                   : slotToLpZone(slot);
+  writeU32Le(&payload[2], toyId);
   bool ok = sendFrameUart(LP_MSG_TAG_SET, payload, sizeof(payload));
   if (padKnown && padPaired) {
     sendFrameTcp(LP_MSG_TAG_SET, payload, sizeof(payload));
@@ -887,83 +922,88 @@ static void saveMode() {
   prefs.end();
 }
 
+// Append a JSON-escaped string to buf[pos..bufSize-1].  Returns new pos.
+static int jsonAppendEscaped(char* buf, int pos, int bufSize, const char* s) {
+  for (; *s && pos < bufSize - 2; s++) {
+    const char c = *s;
+    if (c == '"' || c == '\\') { buf[pos++] = '\\'; }
+    buf[pos++] = c;
+  }
+  return pos;
+}
+
 static void sendStateJson() {
-  String json = "{";
-  json += "\"mode\":\"";
-  json += modeToString(runtimeMode);
-  json += "\",";
-  json += "\"ssid\":\"";
-  json += apSsid;
-  json += "\",";
-  json += "\"paired\":";
-  json += (padPaired ? "true" : "false");
-  json += ",";
-  json += "\"padEndpoint\":\"";
+  // Static buffer — zero heap allocation per call, no fragmentation.
+  // Sized for worst case: 3 lights + 7 slots (24-char labels) +
+  // 24 toybox entries (24-char labels) + fixed fields + d2dbg.
+  static char buf[4096];
+  int pos = 0;
+  const int N = (int)sizeof(buf);
+#define JS(fmt, ...) pos += snprintf(buf + pos, N - pos, fmt, ##__VA_ARGS__)
+
+  // IP as plain C string to avoid String allocation.
+  char ipStr[16] = "-";
   if (padPaired) {
-    json += padIp.toString();
-    json += ":";
-    json += String(padClient.connected() ? padClient.remotePort() : 0);
-  } else {
-    json += "-";
+    const IPAddress ip = padIp;
+    snprintf(ipStr, sizeof(ipStr), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
   }
-  json += "\",";
-  json += "\"hasSecret\":";
-  json += (sharedSecret != 0 ? "true" : "false");
-  json += ",";
 
-  json += "\"lights\":[";
+  JS("{\"mode\":\"%s\",", modeToString(runtimeMode));
+  JS("\"ssid\":\"%s\",", apSsid.c_str());
+  JS("\"paired\":%s,", padPaired ? "true" : "false");
+  JS("\"padEndpoint\":\"%s", ipStr);
+  if (padPaired) {
+    JS(":%u", (unsigned)(padClient.connected() ? padClient.remotePort() : 0));
+  }
+  JS("\",");
+  JS("\"hasSecret\":%s,", sharedSecret != 0 ? "true" : "false");
+
+  JS("\"lights\":[");
   for (uint8_t i = 0; i < kLightZoneCount; i++) {
-    if (i > 0) {
-      json += ",";
-    }
-    json += "{\"r\":" + String(lightZones[i].r) + ",\"g\":" +
-            String(lightZones[i].g) + ",\"b\":" + String(lightZones[i].b) + "}";
+    if (i > 0) JS(",");
+    JS("{\"r\":%u,\"g\":%u,\"b\":%u}", lightZones[i].r, lightZones[i].g, lightZones[i].b);
   }
-  json += "],";
+  JS("],");
 
-  json += "\"slots\":[";
+  JS("\"slots\":[");
   for (uint8_t i = 0; i < kSlotCount; i++) {
-    if (i > 0) {
-      json += ",";
-    }
-    json += "{";
-    json += "\"occupied\":";
-    json += (padSlots[i].occupied ? "true" : "false");
-    json += ",\"toyId\":" + String((unsigned long)padSlots[i].toyId);
-    json += ",\"type\":\"" + String(toyTypeToString(padSlots[i].toyType)) + "\"";
-    json += ",\"label\":\"";
-    json += String(padSlots[i].label);
-    json += "\"}";
+    if (i > 0) JS(",");
+    JS("{\"occupied\":%s,\"toyId\":%lu,\"type\":\"%s\",\"label\":\"",
+       padSlots[i].occupied ? "true" : "false",
+       (unsigned long)padSlots[i].toyId,
+       toyTypeToString(padSlots[i].toyType));
+    pos = jsonAppendEscaped(buf, pos, N, padSlots[i].label);
+    JS("\"}");
   }
-  json += "],";
+  JS("],");
 
-  json += "\"toybox\":[";
+  JS("\"toybox\":[");
   bool first = true;
   for (uint8_t i = 0; i < kToyboxLimit; i++) {
-    if (!toybox[i].inUse) {
-      continue;
-    }
-    if (!first) {
-      json += ",";
-    }
+    if (!toybox[i].inUse) continue;
+    if (!first) JS(",");
     first = false;
-    json += "{";
-    json += "\"index\":" + String(i);
-    json += ",\"toyId\":" + String((unsigned long)toybox[i].toyId);
-    json += ",\"type\":\"" + String(toyTypeToString(toybox[i].toyType)) + "\"";
-    json += ",\"label\":\"" + String(toybox[i].label) + "\"";
-    json += "}";
+    JS("{\"index\":%u,\"toyId\":%lu,\"type\":\"%s\",\"label\":\"",
+       i, (unsigned long)toybox[i].toyId, toyTypeToString(toybox[i].toyType));
+    pos = jsonAppendEscaped(buf, pos, N, toybox[i].label);
+    JS("\"}");
   }
-  json += "]";
-  json += ",\"gameActive\":";
-  {
-    const uint32_t msNow = millis();
-    json += ((sLastLedCmdFromRp2040Ms != 0) && (msNow - sLastLedCmdFromRp2040Ms) < 30000u)
-                ? "true" : "false";
-  }
-  json += "}";
+  JS("],");
 
-  web.send(200, "application/json", json);
+  const uint32_t msNow = millis();
+  const bool gameActive = (sLastLedCmdFromRp2040Ms != 0) &&
+                          (msNow - sLastLedCmdFromRp2040Ms) < 30000u;
+  JS("\"gameActive\":%s,", gameActive ? "true" : "false");
+
+  JS("\"d2dbg\":\"");
+  pos = jsonAppendEscaped(buf, pos, N, sPadD2Debug);
+  JS("\"}");
+
+#undef JS
+  if (pos >= N) pos = N - 1;
+  buf[pos] = '\0';
+
+  web.send(200, "application/json", buf);
 }
 
 static void handleApiMode() {
@@ -973,8 +1013,21 @@ static void handleApiMode() {
     web.send(400, "text/plain", "missing mode");
     return;
   }
+  const RuntimeMode prevMode = runtimeMode;
   runtimeMode = modeFromString(modeStr);
   saveMode();
+
+  if (runtimeMode == MODE_EMULATOR && prevMode != MODE_EMULATOR) {
+    // Clear all RP2040 slot state — physical toys are no longer forwarded
+    // in emulator mode so the game should start with a clean slate.
+    sendFrameUart(LP_MSG_TAG_CLEAR, nullptr, 0);
+    // Turn off the physical toypad lights; emulator mode owns the light state.
+    if (padKnown && padPaired) {
+      const uint8_t offPayload[4] = {0xff, 0, 0, 0};  // zone=all, r=g=b=0
+      sendFrameTcp(LP_MSG_LED_CMD, offPayload, sizeof(offPayload));
+    }
+  }
+
   web.send(200, "text/plain", "ok");
 }
 
@@ -1025,6 +1078,8 @@ static void handleApiSlotPlace() {
     return;
   }
 
+  // For virtual toys the zone is derived from the slot number.
+  padSlots[slot - 1].zone = slotToLpZone((uint8_t)slot);
   sendTagSet((uint8_t)slot, toyId);
   if (!parseJsonString(body, "type", type)) {
     type = "unknown";
@@ -1329,7 +1384,7 @@ static void processTcpIn() {
       sendAckTcp(frame.header.seq);
     }
 
-    observeFrameState(frame);
+    observeFrameState(frame, true /*fromPad*/);
 
     if (frame.header.type == LP_MSG_HELLO || frame.header.type == LP_MSG_PAIR_SET) {
       continue;
@@ -1347,10 +1402,28 @@ static void processTcpIn() {
         Serial.print("[pad-dbg] ");
         Serial.println(msg);
       }
+      // Capture the 4-variant NFC diagnostic for the webui.
+      {
+        char msg[LP_MAX_PAYLOAD + 1];
+        const uint8_t len = frame.header.length < LP_MAX_PAYLOAD
+                                ? frame.header.length : LP_MAX_PAYLOAD;
+        memcpy(msg, frame.payload, len);
+        msg[len] = '\0';
+        if (strncmp(msg, "aa-le:", 6) == 0) {
+          strlcpy(sPadD2Debug, msg, sizeof(sPadD2Debug));
+        }
+      }
       continue;
     }
 
     // Re-encode and forward to RP2040 with original seq.
+    // In emulator mode the console owns slot state; physical TAG_SET/TAG_CLEAR
+    // must not reach the RP2040 or the game would see phantom physical toys.
+    if (runtimeMode == MODE_EMULATOR &&
+        (frame.header.type == LP_MSG_TAG_SET ||
+         frame.header.type == LP_MSG_TAG_CLEAR)) {
+      continue;
+    }
     uint8_t wire[sizeof(lp_header_t) + LP_MAX_PAYLOAD + 2];
     uint16_t wireLen = 0;
     if (lp_encode_frame(frame.header.type, frame.header.seq,
@@ -1397,13 +1470,17 @@ static void processUartIn() {
       continue;
     }
 
-    observeFrameState(frame);
+    observeFrameState(frame, false /*fromPad*/);
 
     // Only forward LED commands to the pad. Tag events flow console→RP2040,
     // not the reverse; forwarding HELLOs/ACKs/etc. confuses the pad's LP state.
+    // In emulator mode the physical pad is not under game control, so don't
+    // push game LED colours onto it.
     if (frame.header.type == LP_MSG_LED_CMD) {
       sLastLedCmdFromRp2040Ms = millis();
-      sendFrameTcp(frame.header.type, frame.payload, frame.header.length);
+      if (runtimeMode != MODE_EMULATOR) {
+        sendFrameTcp(frame.header.type, frame.payload, frame.header.length);
+      }
     }
   }
 }
@@ -1628,7 +1705,7 @@ void loop() {
     // own 30 s timeout without us pushing stale game colours at it.
     const bool gameNowActive = (sLastLedCmdFromRp2040Ms != 0) &&
                                (now - sLastLedCmdFromRp2040Ms) < 30000u;
-    if (padKnown && padPaired && ledStateKnown && gameNowActive) {
+    if (padKnown && padPaired && ledStateKnown && gameNowActive && runtimeMode != MODE_EMULATOR) {
       for (uint8_t z = 0; z < kLightZoneCount; z++) {
         const uint8_t ledPayload[4] = {z, lightZones[z].r, lightZones[z].g, lightZones[z].b};
         sendFrameTcp(LP_MSG_LED_CMD, ledPayload, sizeof(ledPayload));
