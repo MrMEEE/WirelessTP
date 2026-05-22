@@ -547,10 +547,14 @@ static uint32_t readPhysicalToyId(const uint8_t uid[7], uint8_t hintFigIdx) {
                     figIdx, (unsigned long)id0, (unsigned long)id1,
                     id0==id1 ? " OK" : " mm");
 
-      // Diagnostic: try all 4 algorithm variants on this pageData.
-      // Runs regardless of id0==id1 so we always get output.
+      // resolvedId: figure ID once any valid algorithm variant confirms id0==id1.
+      uint32_t resolvedId = (id0 == id1) ? id0 : 0;
+
+      // Diagnostic: try all 4 algorithm variants on first hint-slot attempt.
+      // Also adopts the first alternative variant that validates when the primary
+      // (aa-le) fails — handles vehicles that use a different scramble/endianness.
       // Format: "aa-le:ID= xr-le:ID= aa-be:ID! xr-be:ID="
-      if (oi == 0 && attempt == 0) {  // only on the first attempt of the hint slot
+      if (oi == 0 && attempt == 0) {
         struct { bool rpcs3; bool be; const char* tag; } variants[4] = {
           {false, false, "aa-le"},
           {true,  false, "xr-le"},
@@ -565,23 +569,29 @@ static uint32_t readPhysicalToyId(const uint8_t uid[7], uint8_t hintFigIdx) {
                            "%s:%lx%c ",
                            variants[v].tag, (unsigned long)vi0,
                            vi0==vi1 ? '=' : '!');
+          // If primary (aa-le) failed but this variant validates, adopt it.
+          if (resolvedId == 0 && vi0 == vi1) resolvedId = vi0;
           if (dpos >= (int)sizeof(dbg)-1) break;
         }
         strlcpy(sLastD2Debug, dbg, sizeof(sLastD2Debug));
         Serial.printf("[pad] D2 dbg: %s\n", sLastD2Debug);
       }
 
-      if (id0 != id1) break;  // TEA mismatch → wrong slot, stop retrying
+      if (resolvedId == 0) {
+        // No algorithm validated — either wrong slot or wrong key for this toy.
+        if (oi > 0) break;  // fallback slot: wrong slot, stop retrying
+        continue;           // hint slot: might be transient, retry up to maxAttempts
+      }
 
       const bool isVehicle = (pageData[8]==0x00 && pageData[9]==0x01 &&
                               pageData[10]==0x00 && pageData[11]==0x00);
       if (isVehicle)
         snprintf(sLastD2Status, sizeof(sLastD2Status),
-                 "d2:veh:%04lx fi=%u", (unsigned long)id0, figIdx);
+                 "d2:veh:%04lx fi=%u", (unsigned long)resolvedId, figIdx);
       else
         snprintf(sLastD2Status, sizeof(sLastD2Status),
-                 "d2:ok:%04lx fi=%u", (unsigned long)id0, figIdx);
-      return id0;
+                 "d2:ok:%04lx fi=%u", (unsigned long)resolvedId, figIdx);
+      return resolvedId;
     }
   }
 
