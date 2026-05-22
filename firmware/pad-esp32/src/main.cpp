@@ -948,10 +948,21 @@ static void forwardTagEvent(const TagEvent& evt) {
         return;
       }
     }
-    // 3. New toy: find first free global slot (1-7).
+    // 3. New toy: pick a slot from the zone-appropriate group first so the
+    //    webui shows the toy in the correct column (matches slotZone() in JS).
+    //    Layout: center=slot2; left=slots1,4,5; right=slots3,6,7.
+    //    Fall back to any free slot if the zone group is fully occupied.
+    static const uint8_t kZoneSlots[3][3] = {{2,0,0},{1,4,5},{3,6,7}};
+    static const uint8_t kZoneSlotCnt[3]  = {1, 3, 3};
     uint8_t slot = 0;
-    for (uint8_t si = 0; si < 7; si++) {
-      if (!sSlotOccupied[si]) { slot = si + 1; break; }
+    // Try zone-preferred slots first.
+    for (uint8_t pi = 0; pi < kZoneSlotCnt[z] && slot == 0; pi++) {
+      const uint8_t s = kZoneSlots[z][pi];
+      if (s && !sSlotOccupied[s - 1]) slot = s;
+    }
+    // Fall back to any free slot.
+    for (uint8_t si = 0; si < 7 && slot == 0; si++) {
+      if (!sSlotOccupied[si]) slot = si + 1;
     }
     if (slot == 0) {
       Serial.printf("[pad] all slots full, dropping uid=%02x%02x%02x%02x\n",
