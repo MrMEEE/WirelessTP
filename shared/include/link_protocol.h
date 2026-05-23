@@ -17,6 +17,7 @@ typedef enum {
   LP_MSG_HELLO = 0x01,
   LP_MSG_TAG_SET = 0x10,
   LP_MSG_TAG_CLEAR = 0x11,
+  LP_MSG_NFC_WRITE = 0x12,  // [slot(1), page(1), data(4)] — RP2040→console→pad
   LP_MSG_LED_CMD = 0x20,
   LP_MSG_PAIR_SET = 0x30,
   LP_MSG_DEBUG = 0x40,

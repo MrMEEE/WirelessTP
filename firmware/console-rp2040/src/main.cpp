@@ -287,6 +287,7 @@ struct ToyPadState {
   uint32_t slotToyId[7];  // toy ID per slot (index = slot-1, slots 1-7)
   uint8_t slotZone[7];    // LP zone (0=center,1=left,2=right) of each slot
   bool slotIsVehicle[7];  // true if the toy in this slot is a vehicle (vs character)
+  bool slotIsPhysical[7]; // true if the toy came from the physical pad (needs D3 forwarding)
 };
 
 struct ToyInPacketQueue {
@@ -962,6 +963,14 @@ static void handleToyCommand(const ToyPadOutPacket& p) {
           e.valid = true;
           memcpy(e.data, &p.args[2], 4);
           debugPrintf("d3 idx=%u pg=%u", figIndex, page);
+          // Forward to physical NFC tag if this slot has a physical toy.
+          if (toyState.slotIsPhysical[figIndex - 1]) {
+            uint8_t fwd[6] = {
+              figIndex, page,
+              p.args[2], p.args[3], p.args[4], p.args[5]
+            };
+            sendFrameUart(LP_MSG_NFC_WRITE, fwd, sizeof(fwd));
+          }
         } else {
           debugPrintf("d3 idx=%u pg=%u (skip)", p.args[0], p.args[1]);
         }
@@ -1074,6 +1083,10 @@ static void handleFrame(const lp_frame_t& frame) {
           // 6-byte re-syncs from old firmware overwriting the flag).
           if (typeTag == 2) toyState.slotIsVehicle[slot - 1] = true;
           else if (typeTag == 1) toyState.slotIsVehicle[slot - 1] = false;
+          // Byte 7 (optional, 8-byte payload): isPhysical flag from console-esp32.
+          if (frame.header.length >= 8) {
+            toyState.slotIsPhysical[slot - 1] = (frame.payload[7] != 0);
+          }
 
           if (zoneMoved) {
             // Toy moved between zones: emit REMOVE(oldZone) + PLACE(newZone) with
@@ -1101,6 +1114,7 @@ static void handleFrame(const lp_frame_t& frame) {
             memcpy(uid, toyState.slotUid[slot - 1], kToyUidSize);
             toyState.slotUidValid[slot - 1] = false;
             toyState.slotIsVehicle[slot - 1] = false;
+            toyState.slotIsPhysical[slot - 1] = false;
             memset(sPageCache[slot - 1], 0, sizeof(sPageCache[slot - 1]));
             enqueueToyTagEvent(pad, slot, kToyTagActionRemoved, uid);
             debugPrintf("TAG_CLEAR slot=%u", slot);
@@ -1115,6 +1129,7 @@ static void handleFrame(const lp_frame_t& frame) {
           memcpy(uid, toyState.slotUid[s - 1], kToyUidSize);
           toyState.slotUidValid[s - 1] = false;
           toyState.slotIsVehicle[s - 1] = false;
+          toyState.slotIsPhysical[s - 1] = false;
           memset(sPageCache[s - 1], 0, sizeof(sPageCache[s - 1]));
           const uint8_t z = toyState.slotZone[s - 1];  // use tracked zone
           enqueueToyTagEvent(lpZoneToToyZone(z), s, kToyTagActionRemoved, uid);

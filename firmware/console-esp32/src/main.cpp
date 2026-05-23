@@ -47,6 +47,7 @@ typedef struct {
   char label[24];
   uint8_t toyType;
   uint8_t zone;           // LP zone: 0=center, 1=left, 2=right
+  bool isPhysical;        // true = came from pad-esp32 (physical NFC tag)
   bool fromToybox;
   uint8_t toyboxOriginIndex;
 } SlotState;
@@ -678,6 +679,7 @@ static void clearSlotState(uint8_t slotIndex) {
   padSlots[slotIndex].toyType = TOY_UNKNOWN;
   padSlots[slotIndex].label[0] = '\0';
   padSlots[slotIndex].zone = slotToLpZone(slotIndex + 1);
+  padSlots[slotIndex].isPhysical = false;
   padSlots[slotIndex].fromToybox = false;
   padSlots[slotIndex].toyboxOriginIndex = 0xff;
 }
@@ -690,6 +692,7 @@ static void setSlotState(uint8_t slotIndex, uint32_t toyId, const char* label, u
   padSlots[slotIndex].occupied = true;
   padSlots[slotIndex].toyId = toyId;
   padSlots[slotIndex].toyType = toyType;
+  padSlots[slotIndex].isPhysical = false;  // caller sets true if needed (observeFrameState)
   // zone is set separately (by observeFrameState for physical toys, or by
   // handleApiSlotPlace for virtual toys). Default to slot-derived value only
   // if never set (zone field was zeroed at init).
@@ -788,8 +791,10 @@ static void observeFrameState(const lp_frame_t& frame, bool fromPad) {
       // the correct zone rather than the slot-derived fallback.
       if (fromPad) {
         padSlots[slotNum - 1].zone = frame.payload[1];
+        padSlots[slotNum - 1].isPhysical = true;
       } else {
         padSlots[slotNum - 1].zone = slotToLpZone(slotNum);
+        padSlots[slotNum - 1].isPhysical = false;
       }
     }
     return;
@@ -800,7 +805,20 @@ static void observeFrameState(const lp_frame_t& frame, bool fromPad) {
     if (fromPad && runtimeMode == MODE_EMULATOR) return;
     const uint8_t slotNum = frame.payload[0];
     if (slotNum >= 1 && slotNum <= kSlotCount) {
+      padSlots[slotNum - 1].isPhysical = false;
       clearSlotState(slotNum - 1);
+    }
+    return;
+  }
+
+  // LP_MSG_NFC_WRITE: RP2040 asks us to forward a D3 page-write to the physical
+  // toypad so that vehicle tag data is written to the real NFC tag.
+  if (frame.header.type == LP_MSG_NFC_WRITE && !fromPad &&
+      frame.header.length >= 6) {
+    const uint8_t slot = frame.payload[0];
+    if (slot >= 1 && slot <= kSlotCount && padSlots[slot - 1].isPhysical &&
+        padKnown && padPaired) {
+      sendFrameTcp(LP_MSG_NFC_WRITE, frame.payload, frame.header.length);
     }
     return;
   }
@@ -821,13 +839,15 @@ static bool sendTagSet(uint8_t slot, uint32_t toyId, uint8_t toyType = TOY_UNKNO
   // Use the stored zone for this slot (set by observeFrameState for physical
   // toys, or by handleApiSlotPlace for virtual toys) so the RP2040 always
   // sees a consistent zone and never emits a spurious REMOVE+PLACE move event.
-  uint8_t payload[7];
+  uint8_t payload[8];
   payload[0] = slot;
   payload[1] = (slot >= 1 && slot <= kSlotCount)
                    ? padSlots[slot - 1].zone
                    : slotToLpZone(slot);
   writeU32Le(&payload[2], toyId);
   payload[6] = toyType;  // TOY_UNKNOWN=0, TOY_CHARACTER=1, TOY_VEHICLE=2
+  // Byte 7: isPhysical flag so the RP2040 knows to forward D3 writes back.
+  payload[7] = (slot >= 1 && slot <= kSlotCount && padSlots[slot - 1].isPhysical) ? 1 : 0;
   bool ok = sendFrameUart(LP_MSG_TAG_SET, payload, sizeof(payload));
   if (padKnown && padPaired) {
     sendFrameTcp(LP_MSG_TAG_SET, payload, sizeof(payload));
@@ -1429,10 +1449,25 @@ static void processTcpIn() {
     }
     uint8_t wire[sizeof(lp_header_t) + LP_MAX_PAYLOAD + 2];
     uint16_t wireLen = 0;
-    if (lp_encode_frame(frame.header.type, frame.header.seq,
-                        frame.payload, frame.header.length,
-                        wire, sizeof(wire), &wireLen)) {
-      Serial2.write(wire, wireLen);
+    // For TAG_SET from the physical pad, append isPhysical=1 so the RP2040
+    // knows to forward D3 page-writes back via LP_MSG_NFC_WRITE.
+    if (frame.header.type == LP_MSG_TAG_SET &&
+        frame.header.length >= 6 &&
+        frame.header.length < LP_MAX_PAYLOAD) {
+      uint8_t augPayload[LP_MAX_PAYLOAD];
+      memcpy(augPayload, frame.payload, frame.header.length);
+      augPayload[frame.header.length] = 1;  // isPhysical = true
+      if (lp_encode_frame(frame.header.type, frame.header.seq,
+                          augPayload, frame.header.length + 1,
+                          wire, sizeof(wire), &wireLen)) {
+        Serial2.write(wire, wireLen);
+      }
+    } else {
+      if (lp_encode_frame(frame.header.type, frame.header.seq,
+                          frame.payload, frame.header.length,
+                          wire, sizeof(wire), &wireLen)) {
+        Serial2.write(wire, wireLen);
+      }
     }
   }
 }

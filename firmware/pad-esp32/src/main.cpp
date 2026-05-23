@@ -507,6 +507,33 @@ static bool d2ReadPages(uint8_t figIdx, uint8_t page, uint8_t outBuf[16]) {
   return true;
 }
 
+// Write 4 bytes to an NFC page on the physical toypad (fire-and-forget D3).
+// figIdx: 0=center, 1=left, 2=right (lpZone, same as D2).
+// page: NFC page number (e.g. 36 for vehicle ID).
+// data: 4 bytes to write.
+static void d3WritePages(uint8_t figIdx, uint8_t page, const uint8_t data[4]) {
+  if (!sUsbDevOpen) return;
+
+  // Wait for any in-flight OUT transfer (up to 40 ms).
+  for (int i = 0; i < 20 && sUsbOutBusy; i++) vTaskDelay(pdMS_TO_TICKS(2));
+  if (sUsbOutBusy) {
+    Serial.println("[pad] D3 write skipped: USB busy");
+    return;
+  }
+
+  const uint8_t ctr = sMsgNum++;
+  uint8_t buf[kReportSize] = {};
+  buf[0] = 0x55; buf[1] = 0x08; buf[2] = 0xD3; buf[3] = ctr;
+  buf[4] = figIdx; buf[5] = page;
+  buf[6] = data[0]; buf[7] = data[1]; buf[8] = data[2]; buf[9] = data[3];
+  buf[10] = toypadChecksum(buf, 10);
+  Serial.printf("[pad] D3 write figIdx=%u page=%u data=%02x%02x%02x%02x ctr=%u\n",
+                figIdx, page, data[0], data[1], data[2], data[3], ctr);
+  if (!sendToToypad(buf)) {
+    Serial.println("[pad] D3 send failed");
+  }
+}
+
 // Fetch the LEGO character/vehicle ID from the physical pad.
 //
 // hintFigIdx: which physical reader slot (lpZone) the toy was detected on.
@@ -1824,6 +1851,20 @@ static void processTcpIn(uint32_t now) {
 #endif
       continue;
     }
+
+#if PAD_USB_HOST
+    // NFC_WRITE — game wrote to a page on a physical toy; forward as D3 to physical pad.
+    if (frame.header.type == LP_MSG_NFC_WRITE && frame.header.length >= 6) {
+      sendAck(frame.header.seq);
+      const uint8_t slot = frame.payload[0];
+      const uint8_t page = frame.payload[1];
+      if (slot >= 1 && slot <= 7 && sSlotOccupied[slot - 1]) {
+        const uint8_t figIdx = sSlotZone[slot - 1];  // 0=center,1=left,2=right (D3 figIdx)
+        d3WritePages(figIdx, page, &frame.payload[2]);
+      }
+      continue;
+    }
+#endif
 
     // Everything else: ack and ignore
     sendAck(frame.header.seq);
