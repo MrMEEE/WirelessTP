@@ -855,7 +855,6 @@ static void observeFrameState(const lp_frame_t& frame, bool fromPad) {
     const uint8_t r = frame.payload[1];
     const uint8_t g = frame.payload[2];
     const uint8_t b = frame.payload[3];
-    Serial.printf("[led-rx] z=%u r=%u g=%u b=%u\n", zone, r, g, b);
     ledStateKnown = true;  // RP2040 has provided LED state; safe to sync to pad
     if (zone == 0xff) {
       setAllLightZones(r, g, b);

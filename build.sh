@@ -38,8 +38,7 @@ info() { echo -e "${CYAN}» $*${RESET}"; }
 # ── firmware targets ─────────────────────────────────────────────────────────
 # Each entry: "firmware-dir:env-name"
 TARGETS=(
-  "console-rp2040:console_rp2040_ps"
-  "console-rp2040:console_rp2040_xbox360"
+  "console-rp2040:console_rp2040"
   "console-esp32:console_esp32"
   "pad-esp32:pad_esp32"
   "pad-esp32:pad_esp32_nousb"
@@ -85,8 +84,7 @@ if [[ -n "$FILTER" ]]; then
     _env="${_entry##*:}"
     _alias=""
     case "$_env" in
-      console_rp2040_ps)    _alias="console-rp2040-ps" ;;
-      console_rp2040_xbox360) _alias="console-rp2040-xbox" ;;
+      console_rp2040)         _alias="console-rp2040" ;;
       pad_esp32)            _alias="pad-esp32" ;;
       pad_esp32_nousb)      _alias="pad-esp32-nousb" ;;
     esac
@@ -103,8 +101,7 @@ for entry in "${TARGETS[@]}"; do
 
   env_alias=""
   case "$env_name" in
-    console_rp2040_ps)    env_alias="console-rp2040-ps" ;;
-    console_rp2040_xbox360) env_alias="console-rp2040-xbox" ;;
+    console_rp2040)         env_alias="console-rp2040" ;;
     pad_esp32)            env_alias="pad-esp32" ;;
     pad_esp32_nousb)      env_alias="pad-esp32-nousb" ;;
   esac

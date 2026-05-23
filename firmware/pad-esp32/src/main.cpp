@@ -104,9 +104,12 @@ struct PadConfig {
 #if PAD_USB_HOST
 // Tag event decoded from a USB IN report (passed via FreeRTOS queue)
 struct TagEvent {
-  uint8_t lpZone;   // physical pad zone 0-2 (from d[2]-1): 0=center, 1=left, 2=right
-  bool    placed;   // true=placed, false=removed
-  uint8_t uid[7];   // 7-byte NFC UID — unique per toy, used as key for slot assignment
+  uint8_t lpZone;     // physical pad zone 0-2 (from d[2]-1): 0=center, 1=left, 2=right
+  uint8_t padFigIdx;  // slot index assigned by the physical pad (d[4] of 0x56 event)
+                      // 0=first registered toy, 1=second, etc. — NOT zone-based.
+                      // This is what the pad expects back in D2 figIdx.
+  bool    placed;     // true=placed, false=removed
+  uint8_t uid[7];     // 7-byte NFC UID — unique per toy, used as key for slot assignment
 };
 #endif  // PAD_USB_HOST
 
@@ -583,10 +586,11 @@ static uint32_t readPhysicalToyId(const uint8_t uid[7], uint8_t hintFigIdx) {
         const uint32_t vehicleId = (uint32_t)pageData[0] | ((uint32_t)pageData[1] << 8);
         if (vehicleId != 0) {
           if (oi > 0) {
-            // Fallback zone: this is a DIFFERENT vehicle's NFC reader, not ours.
-            // Returning its ID here would assign the wrong toyId to this tag.
-            Serial.printf("[pad] vehicle fallback zone figIdx=%u skipped (another vehicle)\n", figIdx);
-            break;  // stop trying this fallback zone
+            // Fallback slot: the hint figIdx (pad-assigned slot index) failed.
+            // Don't return a vehicle ID from a different slot — it belongs to
+            // a different physical toy (Bug-2 scenario).
+            Serial.printf("[pad] vehicle fallback figIdx=%u skipped (wrong slot)\n", figIdx);
+            break;
           }
           sLastD2IsVehicle = true;
           snprintf(sLastD2Status, sizeof(sLastD2Status),
@@ -697,14 +701,13 @@ static void usbInCallback(usb_transfer_t* xfer) {
       const uint8_t action  = d[5];  // 0=placed, 1=removed
       if (padZone >= 1 && padZone <= 3) {
         TagEvent evt;
-        evt.lpZone = padZone - 1;  // 0=center, 1=left, 2=right
-        evt.placed = (action == 0);
+        evt.lpZone    = padZone - 1;  // 0=center, 1=left, 2=right
+        evt.padFigIdx = d[4];           // pad-assigned slot index for D2 reads
+        evt.placed    = (action == 0);
         memcpy(evt.uid, &d[6], 7);
         xQueueSend(sTagQueue, &evt, 0);
       }
     } else if (d[0] == 0x55) {
-      Serial.printf("[usb-in] 0x55 d1=%02x ctr=%02x d3=%02x d4=%02x\n",
-                    d[1], d[2], d[3], d[4]);
       if (d[1] == 0x12 && d[3] == 0x00) {
         // D2 success: [0x55, 0x12, counter, 0x00, <16 bytes NFC data>]
         const uint8_t ctr = d[2];
@@ -1053,7 +1056,7 @@ static void forwardTagEvent(const TagEvent& evt) {
       return;
     }
     // Read real LEGO character ID from NFC page 36 of the physical figure.
-    uint32_t toyId = readPhysicalToyId(evt.uid, evt.lpZone);
+    uint32_t toyId = readPhysicalToyId(evt.uid, evt.padFigIdx);
     if (toyId == 0) {
       // Fallback: UID bytes — game won't recognise the toy but at least shows it.
       toyId = (uint32_t)evt.uid[0] | ((uint32_t)evt.uid[1] << 8) |

@@ -33,10 +33,13 @@ The profile should gate:
 - control request handling quirks
 - timing/heartbeat behavior if needed
 
-PlatformIO build environments:
+PlatformIO build environment:
 
-- PlayStation: `console_rp2040_ps`
-- Xbox 360: `console_rp2040_xbox360`
+- Single unified build: `console_rp2040` (profile selected at runtime via GPIO switch)
+
+The compile-time `TOY_PROFILE_XBOX360` flag has been removed; both profiles are compiled
+in and the active profile is determined by reading the mode switch GPIO at boot and
+continuously at runtime.
 
 ## Xbox 360 strategy note
 

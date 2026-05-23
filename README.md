@@ -55,17 +55,14 @@ You can use either:
 1. Arduino IDE per board, or
 2. PlatformIO with one env per target.
 
-For RP2040 profile builds in PlatformIO:
-
-1. PlayStation profile: `console_rp2040_ps`
-2. Xbox 360 profile: `console_rp2040_xbox360`
+For the RP2040 there is a single unified environment — profile selection happens at runtime
+via a physical toggle switch on the board.
 
 The root-level PlatformIO environments are:
 
 1. `console_esp32`
 2. `pad_esp32`
-3. `console_rp2040_ps`
-4. `console_rp2040_xbox360`
+3. `console_rp2040`
 
 ## Next milestones
 
@@ -81,4 +78,4 @@ The root-level PlatformIO environments are:
 - Xbox 360 support is planned next; expect additional compatibility/auth investigation.
 - For Xbox 360, start with donor-board auth reuse before attempting chip-level transplant (`docs/xbox360-auth-donor-strategy.md`).
 - For jailbroken Xbox 360 setups (JTAG/RGH), an optional modern-controller workaround path is also documented (`docs/xbox360-auth-donor-strategy.md`).
-- RP2040 PlatformIO envs are split by profile: `console_rp2040_ps` and `console_rp2040_xbox360`.
+- RP2040 firmware is a single unified build (`console_rp2040`); PS3/Xbox 360 profile is selected at runtime via a physical toggle switch.
