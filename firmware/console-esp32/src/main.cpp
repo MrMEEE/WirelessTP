@@ -112,6 +112,7 @@ static bool sendFrameTcp(uint8_t type, const uint8_t* payload, uint8_t payloadLe
 
 static const char* toyTypeToString(uint8_t toyType);
 static uint8_t toyTypeFromString(const String& s);
+static uint8_t slotToLpZone(uint8_t slotNum);
 static void sendManifestJson();
 static void sendServiceWorkerJs();
 static void sendAppIconSvg();
@@ -814,17 +815,19 @@ static uint8_t slotToLpZone(uint8_t slotNum) {
   return 2;
 }
 
-static bool sendTagSet(uint8_t slot, uint32_t toyId) {
-  // RP2040 handler requires exactly 6 bytes: [slot, zone, toyId[4 LE]].
+static bool sendTagSet(uint8_t slot, uint32_t toyId, uint8_t toyType = TOY_UNKNOWN) {
+  // RP2040 handler accepts 6 bytes [slot, zone, toyId[4 LE]] or 7 bytes
+  // [slot, zone, toyId[4 LE], type] where type: 1=character, 2=vehicle, 0=unknown.
   // Use the stored zone for this slot (set by observeFrameState for physical
   // toys, or by handleApiSlotPlace for virtual toys) so the RP2040 always
   // sees a consistent zone and never emits a spurious REMOVE+PLACE move event.
-  uint8_t payload[6];
+  uint8_t payload[7];
   payload[0] = slot;
   payload[1] = (slot >= 1 && slot <= kSlotCount)
                    ? padSlots[slot - 1].zone
                    : slotToLpZone(slot);
   writeU32Le(&payload[2], toyId);
+  payload[6] = toyType;  // TOY_UNKNOWN=0, TOY_CHARACTER=1, TOY_VEHICLE=2
   bool ok = sendFrameUart(LP_MSG_TAG_SET, payload, sizeof(payload));
   if (padKnown && padPaired) {
     sendFrameTcp(LP_MSG_TAG_SET, payload, sizeof(payload));
@@ -1080,10 +1083,10 @@ static void handleApiSlotPlace() {
 
   // For virtual toys the zone is derived from the slot number.
   padSlots[slot - 1].zone = slotToLpZone((uint8_t)slot);
-  sendTagSet((uint8_t)slot, toyId);
   if (!parseJsonString(body, "type", type)) {
     type = "unknown";
   }
+  sendTagSet((uint8_t)slot, toyId, toyTypeFromString(type));
 
   if (parseJsonUint(body, "toyboxIndex", &toyboxIndex)) {
     // Toy is being placed from the toybox; remove it from toybox
@@ -1696,7 +1699,7 @@ void loop() {
     // unnecessary and overflow its event queue.
     for (uint8_t s = 1; s <= kSlotCount; s++) {
       if (padSlots[s - 1].occupied) {
-        sendTagSet(s, padSlots[s - 1].toyId);
+        sendTagSet(s, padSlots[s - 1].toyId, padSlots[s - 1].toyType);
       }
     }
     // All 3 LED zone states → pad-esp32 so it keeps the toypad lit.

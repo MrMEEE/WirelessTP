@@ -286,6 +286,7 @@ struct ToyPadState {
   bool slotUidValid[7];
   uint32_t slotToyId[7];  // toy ID per slot (index = slot-1, slots 1-7)
   uint8_t slotZone[7];    // LP zone (0=center,1=left,2=right) of each slot
+  bool slotIsVehicle[7];  // true if the toy in this slot is a vehicle (vs character)
 };
 
 struct ToyInPacketQueue {
@@ -705,10 +706,12 @@ static void buildSyntheticFigurePage16(uint8_t slot, uint8_t startPage, uint8_t 
 
   const uint8_t* uid = toyState.slotUid[slot - 1];
   const uint32_t toyId = toyState.slotToyId[slot - 1];
+  const bool isVehicle = toyState.slotIsVehicle[slot - 1];
 
-  // Pre-compute page-36/37 encrypted data only if this window covers those pages.
+  // Pre-compute page-36/37 encrypted data only for characters (not vehicles).
+  // Vehicles store their ID unencrypted at page 36 bytes 0-1 (LE uint16).
   uint8_t enc36[8] = {0};
-  if (startPage <= 37 && startPage + 3 >= 36) {
+  if (!isVehicle && startPage <= 37 && startPage + 3 >= 36) {
     uint8_t figKey[16];
     generateFigureKey(uid, figKey);
     uint8_t toEnc[8];
@@ -740,10 +743,24 @@ static void buildSyntheticFigurePage16(uint8_t slot, uint8_t startPage, uint8_t 
         pp[1]=0x48;  // NTAG213 capability container
         break;
       case 36:
-        memcpy(pp, enc36, 4);
+        if (isVehicle) {
+          // Vehicle: ID stored unencrypted as LE uint16 at bytes 0-1.
+          pp[0]=(uint8_t)toyId; pp[1]=(uint8_t)(toyId>>8);
+          // bytes 2-3 stay zero (memset'd above)
+        } else {
+          memcpy(pp, enc36, 4);
+        }
         break;
       case 37:
-        memcpy(pp, enc36 + 4, 4);
+        if (!isVehicle) memcpy(pp, enc36 + 4, 4);
+        // vehicles: zeros (memset'd above)
+        break;
+      case 38:
+        if (isVehicle) {
+          // Vehicle marker: game distinguishes vehicle from character by
+          // checking bytes 0-1 of page 38 == 0x0001 (big-endian).
+          pp[0]=0x00; pp[1]=0x01; pp[2]=0x00; pp[3]=0x00;
+        }
         break;
       default:
         break;  // zeros
@@ -1029,13 +1046,16 @@ static void handleFrame(const lp_frame_t& frame) {
       debugPrintf("link hello");
       break;
     case LP_MSG_TAG_SET:
-      if (frame.header.length == 6) {
+      if (frame.header.length >= 6) {
         const uint8_t slot   = frame.payload[0];  // global slot (1-7)
         const uint8_t zone   = frame.payload[1];  // LP zone (0=center,1=left,2=right)
         const uint32_t toyId = (uint32_t)frame.payload[2] |
                                ((uint32_t)frame.payload[3] << 8) |
                                ((uint32_t)frame.payload[4] << 16) |
                                ((uint32_t)frame.payload[5] << 24);
+        // Byte 6 (optional, 7-byte payload): toy type: 0=unknown, 1=character, 2=vehicle.
+        // Only update slotIsVehicle when type is explicitly specified (non-zero).
+        const uint8_t typeTag = (frame.header.length >= 7) ? frame.payload[6] : 0;
         const uint8_t pad = lpZoneToToyZone(zone);  // 1=center,2=left,3=right
         uint8_t uid[kToyUidSize];
         buildToyUidFromToyId(toyId, slot, uid);
@@ -1050,6 +1070,10 @@ static void handleFrame(const lp_frame_t& frame) {
           toyState.slotZone[slot - 1]   = zone;
           memcpy(toyState.slotUid[slot - 1], uid, kToyUidSize);
           toyState.slotUidValid[slot - 1] = true;
+          // Update vehicle flag only when explicitly specified (avoids stale
+          // 6-byte re-syncs from old firmware overwriting the flag).
+          if (typeTag == 2) toyState.slotIsVehicle[slot - 1] = true;
+          else if (typeTag == 1) toyState.slotIsVehicle[slot - 1] = false;
 
           if (zoneMoved) {
             // Toy moved between zones: emit REMOVE(oldZone) + PLACE(newZone) with
@@ -1060,7 +1084,7 @@ static void handleFrame(const lp_frame_t& frame) {
             debugPrintf("TAG_SET MOVE slot=%u z%u->z%u", slot, oldZone, zone);
           } else if (!sameId) {
             enqueueToyTagEvent(pad, slot, kToyTagActionPlaced, uid);
-            debugPrintf("TAG_SET slot=%u zone=%u id=%lx", slot, zone, (unsigned long)toyId);
+            debugPrintf("TAG_SET slot=%u zone=%u id=%lx veh=%u", slot, zone, (unsigned long)toyId, toyState.slotIsVehicle[slot-1]);
           }
           // else: same id + same zone (periodic re-sync) -> no-op
         }
@@ -1076,6 +1100,7 @@ static void handleFrame(const lp_frame_t& frame) {
             uint8_t uid[kToyUidSize] = {0};
             memcpy(uid, toyState.slotUid[slot - 1], kToyUidSize);
             toyState.slotUidValid[slot - 1] = false;
+            toyState.slotIsVehicle[slot - 1] = false;
             memset(sPageCache[slot - 1], 0, sizeof(sPageCache[slot - 1]));
             enqueueToyTagEvent(pad, slot, kToyTagActionRemoved, uid);
             debugPrintf("TAG_CLEAR slot=%u", slot);
@@ -1089,6 +1114,7 @@ static void handleFrame(const lp_frame_t& frame) {
           uint8_t uid[kToyUidSize] = {0};
           memcpy(uid, toyState.slotUid[s - 1], kToyUidSize);
           toyState.slotUidValid[s - 1] = false;
+          toyState.slotIsVehicle[s - 1] = false;
           memset(sPageCache[s - 1], 0, sizeof(sPageCache[s - 1]));
           const uint8_t z = toyState.slotZone[s - 1];  // use tracked zone
           enqueueToyTagEvent(lpZoneToToyZone(z), s, kToyTagActionRemoved, uid);

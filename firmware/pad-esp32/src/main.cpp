@@ -138,8 +138,10 @@ static uint32_t sSlotToyId[7]   = {};
 static uint8_t  sSlotUid[7][7]  = {};
 static bool     sSlotOccupied[7]= {};
 static uint8_t  sSlotZone[7]    = {};  // lpZone (0=center,1=left,2=right) of each slot
+static bool     sSlotIsVehicle[7]= {};  // true if the physical toy in this slot is a vehicle
 // Last D2 outcome — filled by readPhysicalToyId, sent as LP debug in forwardTagEvent.
 static char     sLastD2Status[32] = "d2:init";
+static bool     sLastD2IsVehicle  = false;  // set by readPhysicalToyId, read in forwardTagEvent
 // Diagnostic: all-4-variant decryption results from last physical read.
 static char     sLastD2Debug[160] = "";
 #endif
@@ -195,8 +197,9 @@ static uint8_t           sLedLastSentB     = 0;
 // ─── Virtual toy state (serial debug menu) ────────────────────────────────────
 // Slots 1-7, index = slot-1.  For USB-host builds slots 1-3 map to physical
 // zones; for no-USB builds all seven slots are virtual-only.
-static bool     sVirtualOccupied[7] = {};
-static uint32_t sVirtualToyId[7]    = {};
+static bool     sVirtualOccupied[7]  = {};
+static uint32_t sVirtualToyId[7]     = {};
+static bool     sVirtualIsVehicle[7] = {};  // type flag for virtual toys placed via serial menu
 
 // ─── Serial debug menu ────────────────────────────────────────────────────────
 struct CatalogMatch { uint16_t id; char name[40]; };
@@ -515,6 +518,8 @@ static bool d2ReadPages(uint8_t figIdx, uint8_t page, uint8_t outBuf[16]) {
 static uint32_t readPhysicalToyId(const uint8_t uid[7], uint8_t hintFigIdx) {
   if (!sUsbDevOpen) return 0;
 
+  sLastD2IsVehicle = false;  // reset before each read
+
   uint8_t figKey[16];
   padGenerateFigureKey(uid, figKey);
 
@@ -536,6 +541,24 @@ static uint32_t readPhysicalToyId(const uint8_t uid[7], uint8_t hintFigIdx) {
 
       uint8_t pageData[16];
       if (!d2ReadPages(figIdx, 36, pageData)) continue;  // timeout → retry
+
+      // Vehicle-first check: physical vehicle NFC tags store their ID
+      // UNENCRYPTED at page 36 bytes 0-1 (LE uint16).  The vehicle marker is
+      // at bytes 8-11 (= page 38): [0x00, 0x01, 0x00, 0x00].  Check this
+      // BEFORE attempting TEA decryption (decryption gives garbage for vehicles).
+      if (pageData[8]==0x00 && pageData[9]==0x01 &&
+          pageData[10]==0x00 && pageData[11]==0x00) {
+        const uint32_t vehicleId = (uint32_t)pageData[0] | ((uint32_t)pageData[1] << 8);
+        if (vehicleId != 0) {
+          sLastD2IsVehicle = true;
+          snprintf(sLastD2Status, sizeof(sLastD2Status),
+                   "d2:veh:%04lx fi=%u", (unsigned long)vehicleId, figIdx);
+          Serial.printf("[pad] vehicle id=%04lx figIdx=%u\n",
+                        (unsigned long)vehicleId, figIdx);
+          return vehicleId;
+        }
+        // vehicleId == 0: unusual, fall through to character decryption
+      }
 
       uint8_t dec[8];
       padTeaDecryptWithKey(pageData, dec, figKey);
@@ -583,6 +606,11 @@ static uint32_t readPhysicalToyId(const uint8_t uid[7], uint8_t hintFigIdx) {
         continue;           // hint slot: might be transient, retry up to maxAttempts
       }
 
+      // Vehicle marker check: bytes 8-11 of the page-36 D2 read (= raw page 38)
+      // contain [0x00, 0x01, 0x00, 0x00] for vehicles, zeros for characters.
+      // NOTE: this path is reached only for characters (resolvedId != 0 means
+      // TEA decryption validated).  Physical vehicle tags store their ID
+      // UNENCRYPTED, so they are caught by the vehicle-first check below.
       const bool isVehicle = (pageData[8]==0x00 && pageData[9]==0x01 &&
                               pageData[10]==0x00 && pageData[11]==0x00);
       if (isVehicle)
@@ -591,6 +619,7 @@ static uint32_t readPhysicalToyId(const uint8_t uid[7], uint8_t hintFigIdx) {
       else
         snprintf(sLastD2Status, sizeof(sLastD2Status),
                  "d2:ok:%04lx fi=%u", (unsigned long)resolvedId, figIdx);
+      sLastD2IsVehicle = isVehicle;
       return resolvedId;
     }
   }
@@ -946,11 +975,12 @@ static void forwardTagEvent(const TagEvent& evt) {
         const uint8_t oldZ   = sSlotZone[si];
         const uint32_t toyId = sSlotToyId[si];
         sSlotZone[si] = z;
-        uint8_t payload[6];
+        uint8_t payload[7];
         payload[0] = slot; payload[1] = z;
         payload[2] = (uint8_t)toyId;         payload[3] = (uint8_t)(toyId >> 8);
         payload[4] = (uint8_t)(toyId >> 16); payload[5] = (uint8_t)(toyId >> 24);
-        sendFrame(LP_MSG_TAG_SET, payload, 6, true);
+        payload[6] = sSlotIsVehicle[si] ? 2 : 1;  // 1=character, 2=vehicle
+        sendFrame(LP_MSG_TAG_SET, payload, 7, true);
         sLastLedCmdMs = millis();
         Serial.printf("[pad] move z%u->z%u slot=%u uid=%02x%02x%02x%02x\n",
                       oldZ, z, slot,
@@ -996,11 +1026,13 @@ static void forwardTagEvent(const TagEvent& evt) {
     memcpy(sSlotUid[slot - 1], evt.uid, 7);
     sSlotToyId[slot - 1] = toyId;
     sSlotZone[slot - 1]  = z;
-    uint8_t payload[6];
+    sSlotIsVehicle[slot - 1] = sLastD2IsVehicle;
+    uint8_t payload[7];
     payload[0] = slot; payload[1] = z;
     payload[2] = (uint8_t)toyId;         payload[3] = (uint8_t)(toyId >> 8);
     payload[4] = (uint8_t)(toyId >> 16); payload[5] = (uint8_t)(toyId >> 24);
-    sendFrame(LP_MSG_TAG_SET, payload, 6, true);
+    payload[6] = sLastD2IsVehicle ? 2 : 1;  // 1=character, 2=vehicle
+    sendFrame(LP_MSG_TAG_SET, payload, 7, true);
     sLastLedCmdMs = millis();  // tag activity = game is active; suppress standby green
     // Report D2 outcome over LP debug so it appears in console output.
     sendFrame(LP_MSG_DEBUG, (const uint8_t*)sLastD2Status, strlen(sLastD2Status), false);
@@ -1440,10 +1472,11 @@ static void virtualPlace(uint8_t slot, uint32_t toyId) {
     return;
   }
   const uint8_t zone = slotToLpZoneLocal(slot);
-  uint8_t p[6] = {slot, zone,
+  uint8_t p[7] = {slot, zone,
     (uint8_t)toyId, (uint8_t)(toyId >> 8),
-    (uint8_t)(toyId >> 16), (uint8_t)(toyId >> 24)};
-  sendFrame(LP_MSG_TAG_SET, p, 6, true);
+    (uint8_t)(toyId >> 16), (uint8_t)(toyId >> 24),
+    (uint8_t)(sVirtualIsVehicle[slot - 1] ? 2 : 1)};
+  sendFrame(LP_MSG_TAG_SET, p, 7, true);
   Serial.printf("  Placed ID 0x%04X on slot %u\n", toyId, slot);
 }
 
@@ -1971,10 +2004,11 @@ void loop() {
           for (uint8_t si = 0; si < 7; si++) {
             const uint8_t s = si + 1;
             if (sSlotOccupied[si]) {
-              uint8_t p[6] = {s, sSlotZone[si],
+              uint8_t p[7] = {s, sSlotZone[si],
                 (uint8_t)sSlotToyId[si],        (uint8_t)(sSlotToyId[si] >> 8),
-                (uint8_t)(sSlotToyId[si] >> 16), (uint8_t)(sSlotToyId[si] >> 24)};
-              sendFrame(LP_MSG_TAG_SET, p, 6, false);
+                (uint8_t)(sSlotToyId[si] >> 16), (uint8_t)(sSlotToyId[si] >> 24),
+                (uint8_t)(sSlotIsVehicle[si] ? 2 : 1)};  // 1=char, 2=veh
+              sendFrame(LP_MSG_TAG_SET, p, 7, false);
             } else {
               const uint8_t p[1] = {s};
               sendFrame(LP_MSG_TAG_CLEAR, p, 1, false);
@@ -1997,9 +2031,10 @@ void loop() {
             if (sVirtualOccupied[s - 1]) {
               const uint32_t id = sVirtualToyId[s - 1];
               const uint8_t zone = slotToLpZoneLocal(s);
-              uint8_t p[6] = {s, zone, (uint8_t)id, (uint8_t)(id >> 8),
-                              (uint8_t)(id >> 16), (uint8_t)(id >> 24)};
-              sendFrame(LP_MSG_TAG_SET, p, 6, false);
+              uint8_t p[7] = {s, zone, (uint8_t)id, (uint8_t)(id >> 8),
+                              (uint8_t)(id >> 16), (uint8_t)(id >> 24),
+                              (uint8_t)(sVirtualIsVehicle[s - 1] ? 2 : 1)};
+              sendFrame(LP_MSG_TAG_SET, p, 7, false);
             }
             // Don't send TAG_CLEAR for empty virtual slots — same reason as above.
           }
