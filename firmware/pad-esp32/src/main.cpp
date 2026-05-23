@@ -73,6 +73,8 @@ static const uint32_t kBlinkOffMs   = 200;
 static const uint32_t kSearchOnMs   = 400;
 static const uint32_t kSearchOffMs  = 400;
 static const uint32_t kPhysSyncMs   = 8000; // physical zone TAG_SET/TAG_CLEAR re-sync period
+static const uint32_t kMoveGraceMs  = 3000;  // defer TAG_CLEAR; if re-placed within this window, treat as zone-move (move itself is instant)
+static const uint32_t kLedKeepaliveMs = 8000; // resend LED colour to physical pad every 8 s to suppress its idle-green timer
 static const uint32_t kLedIdleMs    = 300000; // revert to standby green after 5 min of no LED cmds
 
 #if PAD_USB_HOST
@@ -141,7 +143,10 @@ static uint32_t sSlotToyId[7]   = {};
 static uint8_t  sSlotUid[7][7]  = {};
 static bool     sSlotOccupied[7]= {};
 static uint8_t  sSlotZone[7]    = {};  // lpZone (0=center,1=left,2=right) of each slot
-static bool     sSlotIsVehicle[7]= {};  // true if the physical toy in this slot is a vehicle
+static bool     sSlotIsVehicle[7]    = {};  // true if the physical toy in this slot is a vehicle
+// Move-grace: deferred TAG_CLEAR so zone-moves reuse the same slot.
+static bool     sSlotPendingRemove[7] = {};  // REMOVE received but TAG_CLEAR not yet sent
+static uint32_t sSlotRemoveMs[7]      = {};  // millis() when REMOVE was received
 // Last D2 outcome — filled by readPhysicalToyId, sent as LP debug in forwardTagEvent.
 static char     sLastD2Status[32] = "d2:init";
 static bool     sLastD2IsVehicle  = false;  // set by readPhysicalToyId, read in forwardTagEvent
@@ -1004,22 +1009,28 @@ static void forwardTagEvent(const TagEvent& evt) {
   const uint8_t z = evt.lpZone;  // 0=center, 1=left, 2=right
 
   if (evt.placed) {
-    // 1. Ignore if this UID is already tracked in THIS zone (duplicate event).
+    // 1. Duplicate / put-back: UID already tracked in THIS zone.
+    //    Also cancels any pending removal if the toy was briefly lifted and returned.
     for (uint8_t si = 0; si < 7; si++) {
       if (sSlotOccupied[si] && sSlotZone[si] == z &&
-          memcmp(sSlotUid[si], evt.uid, 7) == 0) return;
+          memcmp(sSlotUid[si], evt.uid, 7) == 0) {
+        sSlotPendingRemove[si] = false;  // toy is back — cancel deferred TAG_CLEAR
+        return;
+      }
     }
-    // 2. Fast-move: UID already tracked in a DIFFERENT zone (PLACE before REMOVE).
-    //    Keep the same slot so the game sees a zone-move, not a new figure.
-    //    Update sSlotZone so the subsequent stale REMOVE (from the old zone) is ignored.
-    //    Send TAG_SET with the new zone; console-rp2040's zoneMoved logic emits
-    //    REMOVE(oldPad, slot) + PLACE(newPad, slot) with the same figIndex.
+    // 2. Zone-move: UID tracked in a DIFFERENT zone.
+    //    Handles both PLACE-before-REMOVE (physical pad quirk) and the normal
+    //    REMOVE-then-PLACE case (REMOVE was deferred by kMoveGraceMs grace period).
+    //    Keep the same slot so console-rp2040's zoneMoved logic emits
+    //    REMOVE(oldPad, slot) + PLACE(newPad, slot) with the same figIndex,
+    //    which RPCS3 recognises as a move rather than a new toy (no duplicate).
     for (uint8_t si = 0; si < 7; si++) {
       if (sSlotOccupied[si] && sSlotZone[si] != z &&
           memcmp(sSlotUid[si], evt.uid, 7) == 0) {
         const uint8_t slot   = si + 1;
         const uint8_t oldZ   = sSlotZone[si];
         const uint32_t toyId = sSlotToyId[si];
+        sSlotPendingRemove[si] = false;  // confirmed move — cancel deferred TAG_CLEAR
         sSlotZone[si] = z;
         uint8_t payload[7];
         payload[0] = slot; payload[1] = z;
@@ -1035,6 +1046,9 @@ static void forwardTagEvent(const TagEvent& evt) {
       }
     }
     // 3. New toy: pick a slot from the zone-appropriate group first so the
+    //    webui shows the toy in the correct column. Only consider slots that are
+    //    truly free (not occupied, not pending-remove — pending-remove slots may
+    //    still be reclaimed by the move-grace logic).
     //    webui shows the toy in the correct column (matches slotZone() in JS).
     //    Layout: center=slot2; left=slots1,4,5; right=slots3,6,7.
     //    Fall back to any free slot if the zone group is fully occupied.
@@ -1044,11 +1058,11 @@ static void forwardTagEvent(const TagEvent& evt) {
     // Try zone-preferred slots first.
     for (uint8_t pi = 0; pi < kZoneSlotCnt[z] && slot == 0; pi++) {
       const uint8_t s = kZoneSlots[z][pi];
-      if (s && !sSlotOccupied[s - 1]) slot = s;
+      if (s && !sSlotOccupied[s - 1] && !sSlotPendingRemove[s - 1]) slot = s;
     }
-    // Fall back to any free slot.
+    // Fall back to any truly free slot.
     for (uint8_t si = 0; si < 7 && slot == 0; si++) {
-      if (!sSlotOccupied[si]) slot = si + 1;
+      if (!sSlotOccupied[si] && !sSlotPendingRemove[si]) slot = si + 1;
     }
     if (slot == 0) {
       Serial.printf("[pad] all slots full, dropping uid=%02x%02x%02x%02x\n",
@@ -1099,11 +1113,14 @@ static void forwardTagEvent(const TagEvent& evt) {
       }
     }
     if (slot == 0) return;  // UID not in this zone -> stale REMOVE (toy moved), ignore
-    sSlotOccupied[slot - 1] = false;
-    const uint8_t payload[1] = {slot};
-    sendFrame(LP_MSG_TAG_CLEAR, payload, 1, true);
+    // Defer the TAG_CLEAR instead of sending immediately.  If the toy is placed in
+    // another zone within kMoveGraceMs we reuse this slot → console-rp2040 sees a
+    // zone-move (same figIndex) → RPCS3 moves the character rather than spawning a copy.
+    sSlotPendingRemove[slot - 1] = true;
+    sSlotRemoveMs[slot - 1] = millis();
+    // sSlotOccupied stays true so the slot is not reassigned during the grace period.
     sLastLedCmdMs = millis();  // tag activity = game is active; suppress standby green
-    Serial.printf("[pad] removed z=%u slot=%u uid=%02x%02x%02x%02x\n",
+    Serial.printf("[pad] pending-remove z=%u slot=%u uid=%02x%02x%02x%02x\n",
                   z, slot, evt.uid[0], evt.uid[1], evt.uid[2], evt.uid[3]);
   }
 }
@@ -2053,6 +2070,20 @@ void loop() {
           forwardTagEvent(evt);
         }
       }
+      // Move-grace flush: commit deferred TAG_CLEARs for toys removed >kMoveGraceMs
+      // ago without being re-placed elsewhere.  If re-placed within the grace period,
+      // forwardTagEvent() cancels the pending-remove flag and handles it as a move.
+      {
+        for (uint8_t si = 0; si < 7; si++) {
+          if (sSlotPendingRemove[si] && (now - sSlotRemoveMs[si]) >= kMoveGraceMs) {
+            sSlotPendingRemove[si] = false;
+            sSlotOccupied[si]      = false;
+            const uint8_t payload[1] = {(uint8_t)(si + 1)};
+            sendFrame(LP_MSG_TAG_CLEAR, payload, 1, true);
+            Serial.printf("[pad] removed (deferred) slot=%u\n", si + 1);
+          }
+        }
+      }
       // Periodic re-sync: broadcast full physical pad state every kPhysSyncMs.
       // TAG_SET for occupied slots, TAG_CLEAR for empty — lets the RP2040 correct
       // its state within one sync period even if a removal event was missed.
@@ -2063,7 +2094,7 @@ void loop() {
           lastPadSyncMs = now;
           for (uint8_t si = 0; si < 7; si++) {
             const uint8_t s = si + 1;
-            if (sSlotOccupied[si]) {
+            if (sSlotOccupied[si] && !sSlotPendingRemove[si]) {
               uint8_t p[7] = {s, sSlotZone[si],
                 (uint8_t)sSlotToyId[si],        (uint8_t)(sSlotToyId[si] >> 8),
                 (uint8_t)(sSlotToyId[si] >> 16), (uint8_t)(sSlotToyId[si] >> 24),
@@ -2076,8 +2107,24 @@ void loop() {
           }
         }
       }
+      // LED keepalive: resend last known colour to the physical pad every
+      // kLedKeepaliveMs to reset its built-in idle timer.  Without this the
+      // pad hardware reverts to all-green after ~30 s of no C0 commands.
+      {
+        static uint32_t lastLedKeepaliveMs = 0;
+        if (sUsbDevOpen && sLastLedCmdMs != 0 &&
+            (now - lastLedKeepaliveMs) >= kLedKeepaliveMs) {
+          lastLedKeepaliveMs = now;
+          if (sLedLastSentValid) {
+            toypadLedAll(sLedLastSentR, sLedLastSentG, sLedLastSentB);
+          } else {
+            for (uint8_t z = 0; z < 3; z++) {
+              toypadLedZone(z, sLedR[z], sLedG[z], sLedB[z]);
+            }
+          }
+        }
+      }
 #endif
-      // Periodic re-sync of virtual toy slots.
       // USB host: skip any slot that has a physical toy present.
       // No-USB:   covers all slots 1-7.
       {

@@ -179,7 +179,9 @@ static const char kPortalPage[] = R"HTML(
     .touch-note { color:var(--muted); font-size:.82rem; margin-bottom:6px; }
     .status-row { display:flex; gap:8px; flex-wrap:wrap; }
     .badge { background:#273552; border:1px solid rgba(255,255,255,.2); border-radius:999px; padding:5px 8px; font-size:.84rem; }
-    .pad-grid { display:grid; grid-template-columns:repeat(5,minmax(46px,1fr)); gap:8px; align-items:center; justify-items:center; }
+    .pad-grid { display:grid; grid-template-columns:2fr 1fr 2fr; gap:12px; align-items:start; }
+    .zone-col { display:flex; flex-direction:column; gap:8px; align-items:center; width:100%; }
+    .zone-label { font-size:.72rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.07em; padding:2px 0; }
     .slot { width:100%; max-width:130px; min-height:76px; border-radius:11px; background:#3b465e; border:1px solid rgba(255,255,255,.25); text-align:center; font-size:.76rem; line-height:1.15; padding:8px; display:flex; align-items:center; justify-content:center; position:relative; color:var(--muted); }
     .slot.filled { color:#ffffff; text-shadow:0 1px 2px rgba(0,0,0,.7); font-weight:700; }
     .slot.spacer { visibility:hidden; }
@@ -253,7 +255,7 @@ static const char kPortalPage[] = R"HTML(
   </div>
 
   <script>
-    const padRows = [[1,0,2,0,3],[4,5,0,6,7]];
+    // padRows removed — pad grid now renders by actual LP zone from /api/state
     const FAST_POLL_MS = 250;
     const SLOW_POLL_MS = 1200;
     let selectedToyboxIndex = null;
@@ -571,15 +573,27 @@ static const char kPortalPage[] = R"HTML(
           catch (err) { alert("Remove failed: " + err.message); }
         };
       });
-      document.getElementById("padGrid").innerHTML = padRows.flatMap((row) => row).map((slotNum) => {
-        if (!slotNum) return `<div class="slot spacer"></div>`;
+      const renderPadSlot = (slotNum) => {
         const s = data.slots[slotNum - 1];
-        const zone = slotZone(slotNum);
+        const zone = s.zone !== undefined ? s.zone : slotZone(slotNum);
         const light = ledCorrect(data.lights[zone] || { r: 0, g: 0, b: 0 });
         const slotStyle = `background:${rgbCss(light, 0.3)}; border-color:${rgbCss(light, 0.9)};`;
         const clear = s.occupied ? `<button class="clear-slot" data-clear="${slotNum}">x</button>` : "";
         return `<div class="slot ${s.occupied ? "filled" : ""} drop" data-slot="${slotNum}" style="${slotStyle}">S${slotNum}<br>${slotLabel(s)}${clear}</div>`;
-      }).join("");
+      };
+      const renderZoneCol = (zoneIdx, zoneName) => {
+        // Group by static physical zone (slot number → pad position).
+        // s.zone from the server tracks the actual physical zone a toy was
+        // placed on and is only used for LED colour — not for column placement.
+        const slots = [];
+        for (let n = 1; n <= 7; n++) {
+          if (slotZone(n) === zoneIdx) slots.push(n);
+        }
+        return `<div class="zone-col" data-zone="${zoneIdx}"><div class="zone-label">${zoneName}</div>${slots.map(renderPadSlot).join('')}</div>`;
+      };
+      // lpZone: 0=center, 1=left, 2=right
+      document.getElementById("padGrid").innerHTML =
+        renderZoneCol(1, "Left") + renderZoneCol(0, "Center") + renderZoneCol(2, "Right");
       updateSelectionState(data);
       installDragAndDrop(data);
     }
@@ -928,6 +942,7 @@ static void observeFrameState(const lp_frame_t& frame, bool fromPad) {
     const uint8_t slotNum = frame.payload[0];
     if (slotNum >= 1 && slotNum <= kSlotCount) {
       padSlots[slotNum - 1].isPhysical = false;
+      padSlots[slotNum - 1].zone = slotToLpZone(slotNum);  // reset to static zone
       clearSlotState(slotNum - 1);
     }
     return;
@@ -1113,10 +1128,11 @@ static void sendStateJson() {
   JS("\"slots\":[");
   for (uint8_t i = 0; i < kSlotCount; i++) {
     if (i > 0) JS(",");
-    JS("{\"occupied\":%s,\"toyId\":%lu,\"type\":\"%s\",\"label\":\"",
+    JS("{\"occupied\":%s,\"toyId\":%lu,\"type\":\"%s\",\"zone\":%u,\"label\":\"",
        padSlots[i].occupied ? "true" : "false",
        (unsigned long)padSlots[i].toyId,
-       toyTypeToString(padSlots[i].toyType));
+       toyTypeToString(padSlots[i].toyType),
+       (unsigned)padSlots[i].zone);
     pos = jsonAppendEscaped(buf, pos, N, padSlots[i].label);
     JS("\"}");
   }
@@ -1859,6 +1875,12 @@ void setup() {
   lp_stream_init(&uartParser);
   loadSecret();
   loadMode();
+
+  // Initialise zone field so empty slots render in the correct column
+  // from the moment the web UI first loads (before any TAG_SET arrives).
+  for (uint8_t i = 0; i < kSlotCount; i++) {
+    padSlots[i].zone = slotToLpZone(i + 1);
+  }
 
   Serial.println("[console-esp32] boot");
   if (kEnableUsbDebugConsole) {
