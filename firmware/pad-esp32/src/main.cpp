@@ -373,6 +373,9 @@ static volatile uint8_t sD2WaitCounter  = 0;    // counter we sent; 0 = not wait
 static volatile bool    sD2ReplyReady   = false;
 static          uint8_t sD2PageData[16] = {};   // 4 pages of NFC data from D2 reply
 
+// D3 write ACK tracking (for logging only).
+static volatile uint8_t sD3LastCtr = 0;
+
 // From RPCS3 Dimensions.cpp CHAR_CONSTANT.
 static const uint8_t kCharConstant[17] = {
   0xB7, 0xD5, 0xD7, 0xE6, 0xE7, 0xBA, 0x3C, 0xA8,
@@ -527,10 +530,12 @@ static void d3WritePages(uint8_t figIdx, uint8_t page, const uint8_t data[4]) {
   buf[4] = figIdx; buf[5] = page;
   buf[6] = data[0]; buf[7] = data[1]; buf[8] = data[2]; buf[9] = data[3];
   buf[10] = toypadChecksum(buf, 10);
-  Serial.printf("[pad] D3 write figIdx=%u page=%u data=%02x%02x%02x%02x ctr=%u\n",
+  Serial.printf("[pad] D3 write figIdx=%u page=%u data=%02x%02x%02x%02x ctr=%02x\n",
                 figIdx, page, data[0], data[1], data[2], data[3], ctr);
+  sD3LastCtr = ctr;   // track so usbInCallback can log the ACK
   if (!sendToToypad(buf)) {
     Serial.println("[pad] D3 send failed");
+    sD3LastCtr = 0;
   }
 }
 
@@ -577,6 +582,12 @@ static uint32_t readPhysicalToyId(const uint8_t uid[7], uint8_t hintFigIdx) {
           pageData[10]==0x00 && pageData[11]==0x00) {
         const uint32_t vehicleId = (uint32_t)pageData[0] | ((uint32_t)pageData[1] << 8);
         if (vehicleId != 0) {
+          if (oi > 0) {
+            // Fallback zone: this is a DIFFERENT vehicle's NFC reader, not ours.
+            // Returning its ID here would assign the wrong toyId to this tag.
+            Serial.printf("[pad] vehicle fallback zone figIdx=%u skipped (another vehicle)\n", figIdx);
+            break;  // stop trying this fallback zone
+          }
           sLastD2IsVehicle = true;
           snprintf(sLastD2Status, sizeof(sLastD2Status),
                    "d2:veh:%04lx fi=%u", (unsigned long)vehicleId, figIdx);
@@ -702,6 +713,11 @@ static void usbInCallback(usb_transfer_t* xfer) {
           sD2WaitCounter = 0;   // clear before ready flag (single-core ordering)
           sD2ReplyReady  = true;
         }
+      } else if (sD3LastCtr != 0 && d[2] == sD3LastCtr) {
+        // D3 write ACK from physical toypad.
+        // len=d[1], status=d[3] (0=success, non-zero=error).
+        Serial.printf("[usb-in] D3 ack ctr=%02x len=%02x st=%02x\n", d[2], d[1], d[3]);
+        sD3LastCtr = 0;
       } else if (sD2WaitCounter != 0 && d[2] == sD2WaitCounter) {
         // D2 error response (non-zero status or unexpected length)
         Serial.printf("[usb-in] D2 err d1=%02x st=%02x\n", d[1], d[3]);

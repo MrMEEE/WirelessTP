@@ -81,6 +81,15 @@ uint32_t lastHelloMs = 0;
 uint32_t lastStateSyncMs = 0;
 uint32_t lastDebugHeartbeatMs = 0;
 static char sPadD2Debug[LP_MAX_PAYLOAD + 1] = "";  // last NFC-variant diagnostic from pad
+
+// NFC tag programmer state — set by /api/tag/program/begin, cleared on success/cancel.
+static bool     sProgramModeActive    = false;
+static uint32_t sProgramTargetId      = 0;
+static uint8_t  sProgramTargetType    = TOY_UNKNOWN;
+static char     sProgramTargetLabel[24] = {};
+static uint8_t  sProgramStatus        = 0;   // 0=idle,1=waiting,2=success,3=fail
+static bool     sProgramIntercepted   = false;
+static uint8_t  sProgramInterceptedSlot = 0;
 String apSsid;
 uint32_t sharedSecret = 0;
 RuntimeMode runtimeMode = MODE_EMULATOR;
@@ -183,6 +192,10 @@ static const char kPortalPage[] = R"HTML(
     .slot-button { background:#3e6acc; border:2px solid rgba(255,255,255,.2); border-radius:10px; color:var(--ink); font-weight:700; padding:12px; font-size:1rem; cursor:pointer; }
     .slot-button:hover { background:#4f7ce7; border-color:#76a4ff; }
     .install-note { color:var(--muted); font-size:.82rem; margin-top:8px; }
+    .prog-status { margin-top:12px; padding:10px; border-radius:8px; font-weight:700; text-align:center; display:none; }
+    .prog-status.waiting { background:#1e3a5f; color:#93c5fd; display:block; }
+    .prog-status.success { background:#14532d; color:#86efac; display:block; }
+    .prog-status.fail    { background:#7f1d1d; color:#fca5a5; display:block; }
     @media (max-width:880px) { .layout { grid-template-columns:1fr; } }
   </style>
 </head>
@@ -226,6 +239,19 @@ static const char kPortalPage[] = R"HTML(
     </div>
   </div>
 
+  <div class="modal-overlay" id="progModal">
+    <div class="modal-content">
+      <div class="modal-title">&#9889; Flash NFC Tag</div>
+      <p style="margin:0 0 4px">Vehicle: <b id="progVehicleName"></b></p>
+      <p style="color:var(--muted);font-size:.86rem;margin:0 0 12px">Place a blank NTAG213 tag anywhere on the physical pad, then tap Flash.</p>
+      <div id="progStatus" class="prog-status"></div>
+      <div style="display:flex;gap:8px;margin-top:14px;">
+        <button id="progFlashBtn" class="slot-button" style="flex:1;">Flash</button>
+        <button id="progCancelBtn" class="slot-button" style="flex:1;background:#374151;border-color:#4b5563;">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     const padRows = [[1,0,2,0,3],[4,5,0,6,7]];
     const FAST_POLL_MS = 250;
@@ -240,6 +266,7 @@ static const char kPortalPage[] = R"HTML(
     let deferredInstallPrompt = null;
     let refreshTimer = null;
     let refreshInFlight = false;
+    let progPollTimer = null;
 
     function slotLabel(slot) {
       if (!slot.occupied) return "Empty";
@@ -360,7 +387,12 @@ static const char kPortalPage[] = R"HTML(
     function renderCatalog() {
       const list = document.getElementById("catalogList");
       const entries = catalog.filter(passesCatalogFilter);
-      list.innerHTML = entries.map((item) => `<div class="catalog-item"><div>${item.name}<small>${item.type} | 0x${Number(item.id).toString(16).toUpperCase()} | ${item.world || "Unknown"}</small></div><div class="actions"><button data-add-id="${item.id}" data-add-name="${item.name.replace(/"/g,"&quot;")}" data-add-type="${item.type}" title="Add to Toy Box">📦</button><button data-play-id="${item.id}" data-play-name="${item.name.replace(/"/g,"&quot;")}" data-play-type="${item.type}" title="Play (place on pad)">▶</button></div></div>`).join("");
+      list.innerHTML = entries.map((item) => {
+        const flashBtn = item.type === "vehicle"
+          ? `<button data-flash-id="${item.id}" data-flash-name="${item.name.replace(/"/g,"&quot;")}" data-flash-type="${item.type}" title="Flash to NFC tag">&#9889;</button>`
+          : "";
+        return `<div class="catalog-item"><div>${item.name}<small>${item.type} | 0x${Number(item.id).toString(16).toUpperCase()} | ${item.world || "Unknown"}</small></div><div class="actions"><button data-add-id="${item.id}" data-add-name="${item.name.replace(/"/g,"&quot;")}" data-add-type="${item.type}" title="Add to Toy Box">&#128230;</button><button data-play-id="${item.id}" data-play-name="${item.name.replace(/"/g,"&quot;")}" data-play-type="${item.type}" title="Play (place on pad)">&#9654;</button>${flashBtn}</div></div>`;
+      }).join("");
       list.querySelectorAll("button[data-add-id]").forEach((btn) => {
         btn.onclick = async () => {
           try {
@@ -383,6 +415,71 @@ static const char kPortalPage[] = R"HTML(
           }
         };
       });
+      list.querySelectorAll("button[data-flash-id]").forEach((btn) => {
+        btn.onclick = () => openProgramModal(Number(btn.dataset.flashId), btn.dataset.flashName, btn.dataset.flashType);
+      });
+    }
+    function showProgStatus(text, cls) {
+      const el = document.getElementById("progStatus");
+      el.textContent = text;
+      el.className = "prog-status " + cls;
+    }
+    function closeProgramModal() {
+      clearInterval(progPollTimer);
+      progPollTimer = null;
+      document.getElementById("progModal").classList.remove("active");
+    }
+    async function openProgramModal(id, name, type) {
+      const modal = document.getElementById("progModal");
+      const flashBtn = document.getElementById("progFlashBtn");
+      const cancelBtn = document.getElementById("progCancelBtn");
+      document.getElementById("progVehicleName").textContent = name;
+      document.getElementById("progStatus").className = "prog-status";
+      document.getElementById("progStatus").textContent = "";
+      flashBtn.disabled = false;
+      flashBtn.textContent = "Flash";
+      flashBtn.style.display = "";
+      cancelBtn.textContent = "Cancel";
+      modal.classList.add("active");
+      let started = false;
+      cancelBtn.onclick = async () => {
+        if (started) {
+          await fetch("/api/tag/program/cancel", { method:"POST" }).catch(() => {});
+        }
+        closeProgramModal();
+      };
+      modal.onclick = (e) => { if (e.target === modal) closeProgramModal(); };
+      flashBtn.onclick = async () => {
+        flashBtn.disabled = true;
+        flashBtn.textContent = "...";
+        try {
+          await postJson("/api/tag/program/begin", { id, label:name, type });
+          started = true;
+          showProgStatus("Waiting \u2014 place a blank tag on the pad\u2026", "waiting");
+          progPollTimer = setInterval(async () => {
+            try {
+              const r = await fetch("/api/tag/program/status", { cache:"no-store" });
+              const d = await r.json();
+              if (d.status === "success") {
+                clearInterval(progPollTimer); progPollTimer = null;
+                showProgStatus("\u2713 Tag programmed! Remove it and re-place to use.", "success");
+                flashBtn.style.display = "none";
+                cancelBtn.textContent = "Close";
+                refresh().catch(() => {});
+              } else if (d.status === "fail") {
+                clearInterval(progPollTimer); progPollTimer = null;
+                showProgStatus("\u2717 Failed. Check pad connection and try again.", "fail");
+                flashBtn.disabled = false;
+                flashBtn.textContent = "Retry";
+              }
+            } catch(e) {}
+          }, 500);
+        } catch(e) {
+          showProgStatus("\u2717 " + e.message, "fail");
+          flashBtn.disabled = false;
+          flashBtn.textContent = "Flash";
+        }
+      };
     }
     function installModeButtons() {
       document.querySelectorAll("#modePill button").forEach((btn) => {
@@ -773,11 +870,37 @@ static void observeFrameState(const lp_frame_t& frame, bool fromPad) {
   // In emulator mode the console owns slot state; ignore tag events from the pad
   // so its periodic TAG_CLEAR syncs don't wipe virtual toys.
   if (frame.header.type == LP_MSG_TAG_SET) {
-    if (fromPad && runtimeMode == MODE_EMULATOR) return;  // console owns state
     const uint8_t minLen = fromPad ? 6 : 5;
     if (frame.header.length < minLen) return;
     const uint8_t slotNum = frame.payload[0];
     if (slotNum >= 1 && slotNum <= kSlotCount) {
+      // NFC tag programmer: intercept physical tag placement to flash vehicle data.
+      // Must run BEFORE the emulator early-return so it works in both modes.
+      if (fromPad && sProgramModeActive) {
+        // Send NFC page writes to the pad-esp32 (fire-and-forget D3).
+        if (padKnown && padPaired) {
+          uint8_t p36[6] = {slotNum, 36,
+            (uint8_t)(sProgramTargetId & 0xFF), (uint8_t)(sProgramTargetId >> 8), 0, 0};
+          uint8_t p38[6] = {slotNum, 38, 0x00, 0x01, 0x00, 0x00};
+          sendFrameTcp(LP_MSG_NFC_WRITE, p36, sizeof(p36));
+          sendFrameTcp(LP_MSG_NFC_WRITE, p38, sizeof(p38));
+          sProgramStatus = 2;  // success — NFC_WRITE commands sent
+        } else {
+          sProgramStatus = 3;  // fail — pad not connected
+        }
+        setSlotState(slotNum - 1, sProgramTargetId, sProgramTargetLabel, sProgramTargetType);
+        padSlots[slotNum - 1].zone = frame.payload[1];
+        padSlots[slotNum - 1].isPhysical = true;
+        sProgramModeActive = false;
+        sProgramInterceptedSlot = slotNum;
+        sProgramIntercepted = true;
+        Serial.printf("[prog] flash slot=%u id=0x%04lx st=%u\n",
+                      slotNum, (unsigned long)sProgramTargetId, sProgramStatus);
+        return;
+      }
+      // In emulator mode the console owns slot state; ignore tag events from the pad
+      // so its periodic TAG_CLEAR syncs don't wipe virtual toys.
+      if (fromPad && runtimeMode == MODE_EMULATOR) return;
       // Pad: payload[1]=zone, payload[2..5]=toyId. UART: payload[1..4]=toyId.
       const uint8_t toyOff = fromPad ? 2 : 1;
       const uint32_t toyId = readU32Le(&frame.payload[toyOff]);
@@ -1170,6 +1293,52 @@ static void handleApiToyboxRemove() {
   web.send(200, "text/plain", "ok");
 }
 
+static void handleApiTagProgramBegin() {
+  const String body = web.arg("plain");
+  uint32_t toyId = 0;
+  String label;
+  String type;
+  if (!parseJsonFlexibleId(body, "id", &toyId) || !parseJsonString(body, "label", label)) {
+    web.send(400, "text/plain", "missing id/label");
+    return;
+  }
+  if (!parseJsonString(body, "type", type)) type = "vehicle";
+  if (!padKnown || !padPaired) {
+    web.send(409, "text/plain", "pad not connected");
+    return;
+  }
+  sProgramTargetId   = toyId;
+  sProgramTargetType = toyTypeFromString(type);
+  safeCopyLabel(sProgramTargetLabel, sizeof(sProgramTargetLabel), label);
+  sProgramStatus     = 1;  // waiting
+  sProgramModeActive = true;
+  sProgramIntercepted = false;
+  Serial.printf("[prog] begin id=0x%04lx label=%s\n",
+                (unsigned long)toyId, sProgramTargetLabel);
+  web.send(200, "text/plain", "ok");
+}
+
+static void handleApiTagProgramCancel() {
+  sProgramModeActive = false;
+  sProgramStatus = 0;
+  web.send(200, "text/plain", "ok");
+}
+
+static void handleApiTagProgramStatus() {
+  const char* s;
+  switch (sProgramStatus) {
+    case 1:  s = "waiting"; break;
+    case 2:  s = "success"; break;
+    case 3:  s = "fail";    break;
+    default: s = "idle";    break;
+  }
+  char buf[128];
+  snprintf(buf, sizeof(buf),
+           "{\"status\":\"%s\",\"label\":\"%s\",\"id\":%lu}",
+           s, sProgramTargetLabel, (unsigned long)sProgramTargetId);
+  web.send(200, "application/json", buf);
+}
+
 static void handlePortalRoot() {
   web.send(200, "text/html", kPortalPage);
 }
@@ -1194,6 +1363,9 @@ static void setupCaptivePortal() {
   web.on("/api/toybox/remove", HTTP_POST, handleApiToyboxRemove);
   web.on("/api/slot/place", HTTP_POST, handleApiSlotPlace);
   web.on("/api/slot/clear", HTTP_POST, handleApiSlotClear);
+  web.on("/api/tag/program/begin", HTTP_POST, handleApiTagProgramBegin);
+  web.on("/api/tag/program/cancel", HTTP_POST, handleApiTagProgramCancel);
+  web.on("/api/tag/program/status", HTTP_GET, handleApiTagProgramStatus);
   // Probe URLs used by common client OSes for captive portal detection.
   web.on("/generate_204", HTTP_GET, redirectToPortalRoot);
   web.on("/hotspot-detect.html", HTTP_GET, redirectToPortalRoot);
@@ -1408,6 +1580,18 @@ static void processTcpIn() {
     }
 
     observeFrameState(frame, true /*fromPad*/);
+
+    // NFC programmer intercepted this TAG_SET: forward programmed vehicle ID to
+    // RP2040 instead of the original blank-tag frame, then skip normal forwarding.
+    if (sProgramIntercepted) {
+      const uint8_t sn = sProgramInterceptedSlot;
+      sProgramIntercepted = false;
+      sProgramInterceptedSlot = 0;
+      if (sn >= 1 && sn <= kSlotCount) {
+        sendTagSet(sn, padSlots[sn - 1].toyId, padSlots[sn - 1].toyType);
+      }
+      continue;
+    }
 
     if (frame.header.type == LP_MSG_HELLO || frame.header.type == LP_MSG_PAIR_SET) {
       continue;
