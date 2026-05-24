@@ -573,23 +573,26 @@ static const char kPortalPage[] = R"HTML(
           catch (err) { alert("Remove failed: " + err.message); }
         };
       });
-      const renderPadSlot = (slotNum) => {
+      const renderPadSlot = (slotNum, posLabel) => {
         const s = data.slots[slotNum - 1];
         const zone = s.zone !== undefined ? s.zone : slotZone(slotNum);
         const light = ledCorrect(data.lights[zone] || { r: 0, g: 0, b: 0 });
         const slotStyle = `background:${rgbCss(light, 0.3)}; border-color:${rgbCss(light, 0.9)};`;
         const clear = s.occupied ? `<button class="clear-slot" data-clear="${slotNum}">x</button>` : "";
-        return `<div class="slot ${s.occupied ? "filled" : ""} drop" data-slot="${slotNum}" style="${slotStyle}">S${slotNum}<br>${slotLabel(s)}${clear}</div>`;
+        const lbl = (typeof posLabel === 'string') ? posLabel : `S${slotNum}`;
+        return `<div class="slot ${s.occupied ? "filled" : ""} drop" data-slot="${slotNum}" style="${slotStyle}">${lbl}<br>${slotLabel(s)}${clear}</div>`;
       };
       const renderZoneCol = (zoneIdx, zoneName) => {
-        // Group by static physical zone (slot number → pad position).
-        // s.zone from the server tracks the actual physical zone a toy was
-        // placed on and is only used for LED colour — not for column placement.
-        const slots = [];
-        for (let n = 1; n <= 7; n++) {
-          if (slotZone(n) === zoneIdx) slots.push(n);
-        }
-        return `<div class="zone-col" data-zone="${zoneIdx}"><div class="zone-label">${zoneName}</div>${slots.map(renderPadSlot).join('')}</div>`;
+        // Always show canonical slots in fixed positions (L1/L2/L3, C, R1/R2/R3).
+        // Each slot stays in its home column regardless of its current physical zone.
+        // The box's background color reflects the toy's actual zone, so moving a toy
+        // to another zone tints its home-column box with that zone's LED colour.
+        const canonical = [1,2,3,4,5,6,7].filter(n => slotZone(n) === zoneIdx);
+        const pfx = ['C', 'L', 'R'][zoneIdx];
+        const items = canonical.map((n, pos) =>
+          renderPadSlot(n, canonical.length > 1 ? `${pfx}${pos + 1}` : pfx)
+        );
+        return `<div class="zone-col" data-zone="${zoneIdx}"><div class="zone-label">${zoneName}</div>${items.join('')}</div>`;
       };
       // lpZone: 0=center, 1=left, 2=right
       document.getElementById("padGrid").innerHTML =
