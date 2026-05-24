@@ -583,16 +583,41 @@ static const char kPortalPage[] = R"HTML(
         return `<div class="slot ${s.occupied ? "filled" : ""} drop" data-slot="${slotNum}" style="${slotStyle}">${lbl}<br>${slotLabel(s)}${clear}</div>`;
       };
       const renderZoneCol = (zoneIdx, zoneName) => {
-        // Always show canonical slots in fixed positions (L1/L2/L3, C, R1/R2/R3).
-        // Each slot stays in its home column regardless of its current physical zone.
-        // The box's background color reflects the toy's actual zone, so moving a toy
-        // to another zone tints its home-column box with that zone's LED colour.
+        // Each column always shows a fixed number of rows (L:3, C:1, R:3).
+        // Rows are filled by toys currently in this zone (s.zone === zoneIdx),
+        // then padded with empty placeholders.  A toy that has moved to another
+        // zone does NOT appear here — it appears only in its current zone's column.
         const canonical = [1,2,3,4,5,6,7].filter(n => slotZone(n) === zoneIdx);
+        const capacity  = canonical.length;
         const pfx = ['C', 'L', 'R'][zoneIdx];
-        const items = canonical.map((n, pos) =>
-          renderPadSlot(n, canonical.length > 1 ? `${pfx}${pos + 1}` : pfx)
-        );
-        return `<div class="zone-col" data-zone="${zoneIdx}"><div class="zone-label">${zoneName}</div>${items.join('')}</div>`;
+
+        // Slots physically present in this zone right now.
+        const inZone = [];
+        for (let n = 1; n <= 7; n++) {
+          if (data.slots[n - 1].occupied && data.slots[n - 1].zone === zoneIdx) inZone.push(n);
+        }
+
+        // Free canonical slots (not occupied anywhere) — recycled as drop targets for empty rows.
+        const freeCanonical = canonical.filter(n => !data.slots[n - 1].occupied);
+
+        const rows = [];
+        let freeIdx = 0;
+        for (let pos = 0; pos < capacity; pos++) {
+          const lbl = capacity > 1 ? `${pfx}${pos + 1}` : pfx;
+          if (pos < inZone.length) {
+            rows.push(renderPadSlot(inZone[pos], lbl));
+          } else {
+            const light = ledCorrect(data.lights[zoneIdx] || { r: 0, g: 0, b: 0 });
+            const style = `background:${rgbCss(light, 0.3)}; border-color:${rgbCss(light, 0.9)};`;
+            if (freeIdx < freeCanonical.length) {
+              const slot = freeCanonical[freeIdx++];
+              rows.push(`<div class="slot drop" data-slot="${slot}" style="${style}">${lbl}<br>&nbsp;</div>`);
+            } else {
+              rows.push(`<div class="slot" style="${style}">${lbl}<br>&nbsp;</div>`);
+            }
+          }
+        }
+        return `<div class="zone-col" data-zone="${zoneIdx}"><div class="zone-label">${zoneName}</div>${rows.join('')}</div>`;
       };
       // lpZone: 0=center, 1=left, 2=right
       document.getElementById("padGrid").innerHTML =
