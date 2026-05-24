@@ -10,3 +10,4 @@ __pycache__/
 *.pyc
 compile_commands.json
 *.so
+traces/

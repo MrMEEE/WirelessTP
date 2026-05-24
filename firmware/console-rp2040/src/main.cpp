@@ -564,13 +564,16 @@ static void teaEncryptWithKey(const uint8_t* in, uint8_t* out, const uint8_t key
   out[4]=(uint8_t)v1;     out[5]=(uint8_t)(v1>>8); out[6]=(uint8_t)(v1>>16); out[7]=(uint8_t)(v1>>24);
 }
 
-static void buildToyUidFromToyId(uint32_t toyId, uint8_t slot, uint8_t uidOut[kToyUidSize]) {
+static void buildToyUidFromToyId(uint32_t toyId, uint8_t /*slot*/, uint8_t uidOut[kToyUidSize]) {
   uidOut[0] = (uint8_t)(toyId & 0xff);
   uidOut[1] = (uint8_t)((toyId >> 8) & 0xff);
   uidOut[2] = (uint8_t)((toyId >> 16) & 0xff);
   uidOut[3] = (uint8_t)((toyId >> 24) & 0xff);
   uidOut[4] = 0xa5;
-  uidOut[5] = slot;  // slot (1-7) makes UIDs unique across all pad positions
+  // Stable byte derived from toyId so the UID does not change when the toy
+  // moves between zones (which reassigns its slot number).  RPCS3 matches
+  // zone-moves by UID identity, not by figIndex.
+  uidOut[5] = (uint8_t)(toyId ^ (toyId >> 8) ^ (toyId >> 16) ^ (toyId >> 24));
   uidOut[6] = (uint8_t)(toyId ^ 0x5a);
 }
 

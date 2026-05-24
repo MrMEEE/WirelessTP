@@ -147,6 +147,9 @@ static bool     sSlotIsVehicle[7]    = {};  // true if the physical toy in this 
 // Move-grace: deferred TAG_CLEAR so zone-moves reuse the same slot.
 static bool     sSlotPendingRemove[7] = {};  // REMOVE received but TAG_CLEAR not yet sent
 static uint32_t sSlotRemoveMs[7]      = {};  // millis() when REMOVE was received
+// Zone-canonical slot assignment: center=slot2; left=slots1,4,5; right=slots3,6,7.
+static const uint8_t kZoneSlots[3][3]  = {{2,0,0},{1,4,5},{3,6,7}};
+static const uint8_t kZoneSlotCnt[3]   = {1, 3, 3};
 // Last D2 outcome — filled by readPhysicalToyId, sent as LP debug in forwardTagEvent.
 static char     sLastD2Status[32] = "d2:init";
 static bool     sLastD2IsVehicle  = false;  // set by readPhysicalToyId, read in forwardTagEvent
@@ -1021,26 +1024,56 @@ static void forwardTagEvent(const TagEvent& evt) {
     // 2. Zone-move: UID tracked in a DIFFERENT zone.
     //    Handles both PLACE-before-REMOVE (physical pad quirk) and the normal
     //    REMOVE-then-PLACE case (REMOVE was deferred by kMoveGraceMs grace period).
-    //    Keep the same slot so console-rp2040's zoneMoved logic emits
-    //    REMOVE(oldPad, slot) + PLACE(newPad, slot) with the same figIndex,
-    //    which RPCS3 recognises as a move rather than a new toy (no duplicate).
+    //    Free the old slot and assign a canonical slot in the new zone so the
+    //    old zone can accept a full complement of toys again.  The RP2040 builds
+    //    UIDs from toyId (slot-independent), so RPCS3 sees the same UID in the
+    //    TAG_CLEAR + TAG_SET pair and recognises it as a zone-move.
     for (uint8_t si = 0; si < 7; si++) {
       if (sSlotOccupied[si] && sSlotZone[si] != z &&
           memcmp(sSlotUid[si], evt.uid, 7) == 0) {
-        const uint8_t slot   = si + 1;
-        const uint8_t oldZ   = sSlotZone[si];
-        const uint32_t toyId = sSlotToyId[si];
-        sSlotPendingRemove[si] = false;  // confirmed move — cancel deferred TAG_CLEAR
-        sSlotZone[si] = z;
+        const uint8_t oldSlot   = si + 1;
+        const uint8_t oldZ      = sSlotZone[si];
+        const uint32_t toyId    = sSlotToyId[si];
+        const bool isVehicle    = sSlotIsVehicle[si];
+        uint8_t savedUid[7];
+        memcpy(savedUid, sSlotUid[si], 7);
+        sSlotPendingRemove[si] = false;
+        sSlotOccupied[si]      = false;  // free old slot so new zone can use it
+
+        // Pick a canonical slot in the new zone; fall back to any free slot.
+        uint8_t newSlot = 0;
+        for (uint8_t pi = 0; pi < kZoneSlotCnt[z] && newSlot == 0; pi++) {
+          const uint8_t s = kZoneSlots[z][pi];
+          if (s && !sSlotOccupied[s - 1] && !sSlotPendingRemove[s - 1]) newSlot = s;
+        }
+        for (uint8_t fsi = 0; fsi < 7 && newSlot == 0; fsi++) {
+          if (!sSlotOccupied[fsi] && !sSlotPendingRemove[fsi]) newSlot = fsi + 1;
+        }
+        if (newSlot == 0) {
+          // All slots full — re-occupy old slot and drop the move.
+          sSlotOccupied[si] = true;
+          Serial.printf("[pad] move z%u->z%u FULL, keeping slot=%u\n", oldZ, z, oldSlot);
+          return;
+        }
+
+        // Send TAG_CLEAR for old slot, then TAG_SET for new slot.
+        const uint8_t clrPayload[1] = {oldSlot};
+        sendFrame(LP_MSG_TAG_CLEAR, clrPayload, 1, true);
+
+        sSlotOccupied[newSlot - 1]    = true;
+        memcpy(sSlotUid[newSlot - 1], savedUid, 7);
+        sSlotToyId[newSlot - 1]       = toyId;
+        sSlotZone[newSlot - 1]        = z;
+        sSlotIsVehicle[newSlot - 1]   = isVehicle;
         uint8_t payload[7];
-        payload[0] = slot; payload[1] = z;
+        payload[0] = newSlot; payload[1] = z;
         payload[2] = (uint8_t)toyId;         payload[3] = (uint8_t)(toyId >> 8);
         payload[4] = (uint8_t)(toyId >> 16); payload[5] = (uint8_t)(toyId >> 24);
-        payload[6] = sSlotIsVehicle[si] ? 2 : 1;  // 1=character, 2=vehicle
+        payload[6] = isVehicle ? 2 : 1;
         sendFrame(LP_MSG_TAG_SET, payload, 7, true);
         sLastLedCmdMs = millis();
-        Serial.printf("[pad] move z%u->z%u slot=%u uid=%02x%02x%02x%02x\n",
-                      oldZ, z, slot,
+        Serial.printf("[pad] move z%u->z%u oldslot=%u newslot=%u uid=%02x%02x%02x%02x\n",
+                      oldZ, z, oldSlot, newSlot,
                       evt.uid[0], evt.uid[1], evt.uid[2], evt.uid[3]);
         return;
       }
@@ -1052,8 +1085,6 @@ static void forwardTagEvent(const TagEvent& evt) {
     //    webui shows the toy in the correct column (matches slotZone() in JS).
     //    Layout: center=slot2; left=slots1,4,5; right=slots3,6,7.
     //    Fall back to any free slot if the zone group is fully occupied.
-    static const uint8_t kZoneSlots[3][3] = {{2,0,0},{1,4,5},{3,6,7}};
-    static const uint8_t kZoneSlotCnt[3]  = {1, 3, 3};
     uint8_t slot = 0;
     // Try zone-preferred slots first.
     for (uint8_t pi = 0; pi < kZoneSlotCnt[z] && slot == 0; pi++) {
