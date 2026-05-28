@@ -686,6 +686,21 @@ static const char kPortalPage[] = R"HTML(
     }
     refreshVersions();
     setInterval(() => refreshVersions(), 30000);
+    async function flashFirmware(formEl, statusId) {
+      const el = document.getElementById(statusId);
+      const fi = formEl.querySelector('input[type=file]');
+      if (!fi.files.length) { el.style.color='var(--muted)'; el.textContent='Select a .bin file first'; return; }
+      el.style.color='var(--muted)'; el.textContent='Uploading…';
+      try {
+        const r = await fetch(formEl.action, { method:'POST', body:new FormData(formEl) });
+        const t = await r.text();
+        el.style.color = r.ok ? '#4ade80' : '#f87171';
+        el.textContent = t;
+      } catch(e) {
+        el.style.color='#f87171';
+        el.textContent='Upload failed: '+e.message;
+      }
+    }
   </script>
   <div style="max-width:680px;margin:8px auto;padding:0 14px 16px">
     <div style="background:rgba(25,34,52,.88);border:1px solid rgba(255,255,255,.14);border-radius:12px;padding:12px 14px">
@@ -694,6 +709,33 @@ static const char kPortalPage[] = R"HTML(
         <div><div style="font-size:.72rem;color:var(--muted)">console-esp32</div><div id="fv-console" style="font-family:monospace;font-size:.88rem;margin-top:2px">…</div></div>
         <div><div style="font-size:.72rem;color:var(--muted)">console-rp2040</div><div id="fv-rp2040" style="font-family:monospace;font-size:.88rem;margin-top:2px">…</div></div>
         <div><div style="font-size:.72rem;color:var(--muted)">pad-esp32</div><div id="fv-pad" style="font-family:monospace;font-size:.88rem;margin-top:2px">…</div></div>
+      </div>
+      <div style="margin-top:14px;border-top:1px solid rgba(255,255,255,.1);padding-top:12px;display:flex;flex-direction:column;gap:10px">
+        <div style="font-size:.76rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em">OTA Update</div>
+        <div>
+          <div style="font-size:.78rem;color:var(--muted);margin-bottom:4px">RP2040 firmware (.bin)</div>
+          <form action="/ota/upload-rp2040" enctype="multipart/form-data" onsubmit="event.preventDefault();flashFirmware(this,'st-rp2040')" style="display:flex;gap:6px;align-items:center">
+            <input type="file" name="firmware" accept=".bin" style="flex:1;font-size:.8rem;color:var(--ink);background:#192438;border:1px solid rgba(255,255,255,.2);border-radius:7px;padding:5px 8px">
+            <button type="submit" style="border:0;border-radius:8px;background:#3e6acc;color:#fff;font-weight:700;padding:6px 12px;font-size:.8rem;white-space:nowrap">Flash</button>
+          </form>
+          <div id="st-rp2040" style="font-size:.78rem;margin-top:4px;min-height:1em"></div>
+        </div>
+        <div>
+          <div style="font-size:.78rem;color:var(--muted);margin-bottom:4px">Pad firmware (.bin)</div>
+          <form action="/ota/upload-pad" enctype="multipart/form-data" onsubmit="event.preventDefault();flashFirmware(this,'st-pad')" style="display:flex;gap:6px;align-items:center">
+            <input type="file" name="firmware" accept=".bin" style="flex:1;font-size:.8rem;color:var(--ink);background:#192438;border:1px solid rgba(255,255,255,.2);border-radius:7px;padding:5px 8px">
+            <button type="submit" style="border:0;border-radius:8px;background:#3e6acc;color:#fff;font-weight:700;padding:6px 12px;font-size:.8rem;white-space:nowrap">Flash</button>
+          </form>
+          <div id="st-pad" style="font-size:.78rem;margin-top:4px;min-height:1em"></div>
+        </div>
+        <div>
+          <div style="font-size:.78rem;color:var(--muted);margin-bottom:4px">Console firmware (.bin) — device will reboot</div>
+          <form action="/ota/upload-console" enctype="multipart/form-data" onsubmit="event.preventDefault();flashFirmware(this,'st-console')" style="display:flex;gap:6px;align-items:center">
+            <input type="file" name="firmware" accept=".bin" style="flex:1;font-size:.8rem;color:var(--ink);background:#192438;border:1px solid rgba(255,255,255,.2);border-radius:7px;padding:5px 8px">
+            <button type="submit" style="border:0;border-radius:8px;background:#7c3aed;color:#fff;font-weight:700;padding:6px 12px;font-size:.8rem;white-space:nowrap">Flash</button>
+          </form>
+          <div id="st-console" style="font-size:.78rem;margin-top:4px;min-height:1em"></div>
+        </div>
       </div>
     </div>
   </div>
