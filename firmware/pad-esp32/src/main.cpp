@@ -37,7 +37,7 @@ extern "C" {
 
 // Non-const so the linker places this string in the .data segment,
 // making it scannable in the binary image for OTA target validation.
-static char kFwIdent[] = FW_IDENT_STR;
+static const char kFwIdent[] __attribute__((used)) = FW_IDENT_STR;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 static const char*    kSetupApSsid      = "ToyPad-Setup";
@@ -1967,6 +1967,7 @@ static void processTcpIn(uint32_t now) {
 void setup() {
   // On S2 Mini with USB CDC disabled, Serial routes to UART0 (GPIO 43/44).
   Serial.begin(115200);
+  Serial.println(kFwIdent);  // log firmware ident on boot
   delay(300);
   sBootReason = (uint8_t)esp_reset_reason();
   Serial.printf("[pad] boot, reset reason: %u\n", sBootReason);

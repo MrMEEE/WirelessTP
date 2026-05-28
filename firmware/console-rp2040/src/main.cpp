@@ -8,7 +8,7 @@
 
 // Non-const so the linker places this string in the .data segment,
 // making it scannable in the binary image for OTA target validation.
-static char kFwIdent[] = FW_IDENT_STR;
+static const char kFwIdent[] __attribute__((used)) = FW_IDENT_STR;
 
 // Forward declarations
 static void debugPrintf(const char* fmt, ...);
@@ -1229,6 +1229,7 @@ void setup() {
   Serial1.begin(kUartBaud);  // UART from console ESP32
   lp_stream_init(&uartParser);
 
+  Serial1.println(kFwIdent);  // log firmware ident on boot
   debugPrintf("boot profile=%s", isXboxProfile() ? "xbox360" : "ps");
   debugPrintf("usb vid=0x%04x pid=0x%04x", kUsbVid, kUsbPid);
 

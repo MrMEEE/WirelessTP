@@ -130,7 +130,7 @@ static char sRp2040Version[LP_MAX_PAYLOAD + 1] = "?";
 static char sPadVersion[LP_MAX_PAYLOAD + 1]    = "?";
 // Non-const so the linker places this string in the .data segment,
 // making it scannable in the binary image for OTA target validation.
-static char kFwIdent[] = FW_IDENT_STR;
+static const char kFwIdent[] __attribute__((used)) = FW_IDENT_STR;
 
 static const char* kModePrefKey = "mode";
 
@@ -2339,6 +2339,7 @@ static void setupAccessPoint() {
 
 void setup() {
   Serial.begin(115200);
+  Serial.println(kFwIdent);  // log firmware ident on boot
   LittleFS.begin(true);  // mount, format on first use
   Serial2.begin(kRp2040Baud, SERIAL_8N1, 16, 17);
   lp_stream_init(&uartParser);
