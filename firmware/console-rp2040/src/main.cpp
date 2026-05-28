@@ -1,8 +1,14 @@
 #include <Arduino.h>
 #include <Adafruit_TinyUSB.h>
+#include <Updater.h>
 #include <cstdarg>
 
 #include "link_protocol.h"
+#include "fw_header.h"
+
+// Non-const so the linker places this string in the .data segment,
+// making it scannable in the binary image for OTA target validation.
+static char kFwIdent[] = FW_IDENT_STR;
 
 // Forward declarations
 static void debugPrintf(const char* fmt, ...);
@@ -18,6 +24,20 @@ static bool sendFrameUart(uint8_t type, const uint8_t* payload, uint8_t payloadL
 static const uint32_t kUartBaud = 115200;
 static const uint32_t kHelloMs = 4000;
 static const uint32_t kStateSyncMs = 1000;  // full-state broadcast interval
+
+// ─── DFU / OTA state ───────────────────────────────────────────────────────────
+static const uint16_t kDfuChunkMax  = 1024;
+static const uint8_t  kDfuAckByte   = 0x06;
+static const uint8_t  kDfuNakByte   = 0x15;
+static const uint32_t kDfuTimeoutMs = 10000;  // abort DFU if no chunk for 10 s
+
+static bool     sDfuActive     = false;
+static uint32_t sDfuSize       = 0;
+static uint32_t sDfuReceived   = 0;
+static uint32_t sDfuLastRxMs   = 0;
+static uint8_t  sDfuRxBuf[8 + kDfuChunkMax + 2];  // header(8) + data + crc(2)
+static uint16_t sDfuRxIdx      = 0;
+static uint16_t sDfuRxExpected = 0;
 static const uint8_t kToyPacketSize = 32;
 static const uint8_t kToyMagicHostToPortal = 0x55;
 static const uint8_t kToyMagicPortalEvent = 0x56;
@@ -1049,6 +1069,31 @@ static void debugPrintf(const char* fmt, ...) {
 }
 
 static void handleFrame(const lp_frame_t& frame) {
+  // LP_MSG_OTA_BEGIN requires conditional ACK (only on Updater.begin() success);
+  // handle it before the generic ACK that covers all other frame types.
+  if (frame.header.type == LP_MSG_OTA_BEGIN) {
+    if (frame.header.length >= 4) {
+      const uint32_t size = (uint32_t)frame.payload[0]
+                          | ((uint32_t)frame.payload[1] << 8)
+                          | ((uint32_t)frame.payload[2] << 16)
+                          | ((uint32_t)frame.payload[3] << 24);
+      if (Update.begin(size)) {
+        sDfuActive     = true;
+        sDfuSize       = size;
+        sDfuReceived   = 0;
+        sDfuRxIdx      = 0;
+        sDfuRxExpected = 0;
+        sDfuLastRxMs   = millis();
+        debugPrintf("dfu begin sz=%u", size);
+        sendAck(frame.header.seq);
+      } else {
+        debugPrintf("dfu begin fail: err %d", (int)Update.getError());
+        // No ACK — console-esp32 will time out and report failure.
+      }
+    }
+    return;
+  }
+
   if (frame.header.type != LP_MSG_ACK) {
     sendAck(frame.header.seq);
   }
@@ -1154,6 +1199,18 @@ static void handleFrame(const lp_frame_t& frame) {
       break;
     case LP_MSG_ACK:
       break;
+    case LP_MSG_OTA_COMMIT:
+      // ACK already sent above; give it time to transmit before reboot.
+      debugPrintf("dfu commit rcv=%u sz=%u", sDfuReceived, sDfuSize);
+      delay(100);
+      if (Update.end()) {
+        debugPrintf("dfu ok, rebooting");
+        delay(200);
+        rp2040.restart();
+      } else {
+        debugPrintf("dfu end fail: err %d", (int)Update.getError());
+      }
+      break;
     default:
       debugPrintf("unhandled type=0x%02x", frame.header.type);
       break;
@@ -1206,6 +1263,75 @@ extern "C" void tud_hid_report_complete_cb(uint8_t instance,
 void loop() {
   const uint32_t now = millis();
 
+  // ── DFU raw-chunk receiver ────────────────────────────────────────────────────
+  // Active only during a firmware update; skips LP processing for this loop() tick.
+  if (sDfuActive) {
+    if ((now - sDfuLastRxMs) > kDfuTimeoutMs) {
+      debugPrintf("dfu timeout");
+      Update.end();  // discard staged update
+      sDfuActive = false;
+      sDfuRxIdx = 0;
+      sDfuRxExpected = 0;
+    } else {
+      while (Serial1.available()) {
+        sDfuLastRxMs = now;
+        sDfuRxBuf[sDfuRxIdx++] = (uint8_t)Serial1.read();
+        // Stage 1: accumulate 8-byte chunk header
+        if (sDfuRxExpected == 0 && sDfuRxIdx >= 8) {
+          if (sDfuRxBuf[0] != 0xDF || sDfuRxBuf[1] != 0xC0) {
+            sDfuRxIdx = 0;
+            Serial1.write(kDfuNakByte);
+          } else {
+            const uint16_t clen = (uint16_t)sDfuRxBuf[6] | ((uint16_t)sDfuRxBuf[7] << 8);
+            if (clen == 0 || clen > kDfuChunkMax) {
+              sDfuRxIdx = 0;
+              Serial1.write(kDfuNakByte);
+            } else {
+              sDfuRxExpected = 8 + clen + 2;
+            }
+          }
+        }
+        // Stage 2: process complete chunk (header + data + crc)
+        if (sDfuRxExpected > 0 && sDfuRxIdx >= sDfuRxExpected) {
+          const uint16_t clen    = (uint16_t)sDfuRxBuf[6] | ((uint16_t)sDfuRxBuf[7] << 8);
+          const uint8_t* data    = &sDfuRxBuf[8];
+          const uint16_t recvCrc = (uint16_t)sDfuRxBuf[8 + clen]
+                                 | ((uint16_t)sDfuRxBuf[9 + clen] << 8);
+          if (lp_crc16_ccitt(data, clen) == recvCrc) {
+            const size_t written = Update.write(const_cast<uint8_t*>(data), clen);
+            if (written == clen) {
+              sDfuReceived += clen;
+              Serial1.write(kDfuAckByte);
+              // When all expected bytes are received, exit DFU mode so that
+              // the subsequent LP_MSG_OTA_COMMIT frame is parsed normally.
+              if (sDfuReceived >= sDfuSize) {
+                sDfuActive = false;
+                sDfuRxIdx = 0;
+                sDfuRxExpected = 0;
+                debugPrintf("dfu: all bytes rcv");
+              }
+            } else {
+              debugPrintf("dfu write fail");
+              Update.end();  // discard staged update
+              sDfuActive = false;
+              sDfuRxIdx = 0;
+              sDfuRxExpected = 0;
+              Serial1.write(kDfuNakByte);
+            }
+          } else {
+            debugPrintf("dfu crc fail @%u", sDfuReceived);
+            Serial1.write(kDfuNakByte);
+          }
+          sDfuRxIdx = 0;
+          sDfuRxExpected = 0;
+        }
+      }
+    }
+    TinyUSBDevice.task();
+    serviceToyInQueue();
+    return;  // skip LP heartbeats while DFU is in progress
+  }
+
   while (Serial1.available()) {
     const int c = Serial1.read();
     if (c < 0) {
@@ -1231,8 +1357,12 @@ void loop() {
 
   if ((now - lastHelloMs) >= kHelloMs) {
     lastHelloMs = now;
-    const uint8_t payload[1] = {0x02};
-    sendFrameUart(LP_MSG_HELLO, payload, sizeof(payload));
+    uint8_t helloPayload[LP_MAX_PAYLOAD];
+    helloPayload[0] = 0x02;
+    const size_t rawVerLen = strlen(FIRMWARE_VERSION);
+    const uint8_t verLen = (uint8_t)(rawVerLen < LP_MAX_PAYLOAD - 1 ? rawVerLen : LP_MAX_PAYLOAD - 1);
+    memcpy(&helloPayload[1], FIRMWARE_VERSION, verLen);
+    sendFrameUart(LP_MSG_HELLO, helloPayload, 1 + verLen);
   }
 
   // Drive USB task explicitly so pending events (callbacks, completions)

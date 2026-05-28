@@ -6,9 +6,12 @@
 #include <WiFiClient.h>
 #include <WiFiServer.h>
 #include <WebServer.h>
+#include <LittleFS.h>
+#include <Update.h>
 
 #include <lwip/sockets.h>  // for direct ::send() — bypasses WiFiClient::_connected stale-errno
 #include "link_protocol.h"
+#include "fw_header.h"
 #include "ld_catalog_data.h"
 
 static const uint16_t kPadListenPort = 25100;
@@ -110,6 +113,24 @@ enum AnsiFilterState : uint8_t {
   ANSI_IN_OSC    = 3,  // inside ESC ] ... sequence (terminated by BEL or ESC \)
 };
 AnsiFilterState piAnsiState = ANSI_NORMAL;
+
+// ─── OTA / DFU ──────────────────────────────────────────────────────────────
+static const char*    kOtaRp2040Path   = "/ota-rp2040.bin";
+static const char*    kOtaPadPath      = "/ota-pad.bin";
+static const uint16_t kDfuChunkSize    = 1024;
+static const uint8_t  kDfuAckByte      = 0x06;
+static const uint8_t  kDfuNakByte      = 0x15;
+static const uint32_t kDfuChunkToutMs  = 5000;
+static const uint8_t  kDfuMaxRetries   = 3;
+
+static File sOtaFile;
+static bool sOtaError = false;
+static bool sOtaConsoleValidated = false;
+static char sRp2040Version[LP_MAX_PAYLOAD + 1] = "?";
+static char sPadVersion[LP_MAX_PAYLOAD + 1]    = "?";
+// Non-const so the linker places this string in the .data segment,
+// making it scannable in the binary image for OTA target validation.
+static char kFwIdent[] = FW_IDENT_STR;
 
 static const char* kModePrefKey = "mode";
 
@@ -653,7 +674,29 @@ static const char kPortalPage[] = R"HTML(
     document.addEventListener("visibilitychange", scheduleRefresh);
     loadCatalog().then(() => refresh()).catch(() => {});
     scheduleRefresh();
+    async function refreshVersions() {
+      try {
+        const r = await fetch("/api/versions", { cache:"no-store" });
+        const v = await r.json();
+        const set = (id, val) => { const e = document.getElementById(id); if (e) e.textContent = val || "?"; };
+        set("fv-console", v.console_esp32);
+        set("fv-rp2040",  v.console_rp2040);
+        set("fv-pad",     v.pad_esp32);
+      } catch(_) {}
+    }
+    refreshVersions();
+    setInterval(() => refreshVersions(), 30000);
   </script>
+  <div style="max-width:680px;margin:8px auto;padding:0 14px 16px">
+    <div style="background:rgba(25,34,52,.88);border:1px solid rgba(255,255,255,.14);border-radius:12px;padding:12px 14px">
+      <div style="font-size:.76rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Firmware Versions</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;text-align:center">
+        <div><div style="font-size:.72rem;color:var(--muted)">console-esp32</div><div id="fv-console" style="font-family:monospace;font-size:.88rem;margin-top:2px">…</div></div>
+        <div><div style="font-size:.72rem;color:var(--muted)">console-rp2040</div><div id="fv-rp2040" style="font-family:monospace;font-size:.88rem;margin-top:2px">…</div></div>
+        <div><div style="font-size:.72rem;color:var(--muted)">pad-esp32</div><div id="fv-pad" style="font-family:monospace;font-size:.88rem;margin-top:2px">…</div></div>
+      </div>
+    </div>
+  </div>
 </body>
 </html>
 )HTML";
@@ -1386,6 +1429,317 @@ static void handlePortalRoot() {
   web.send(200, "text/html", kPortalPage);
 }
 
+// ─── OTA / DFU helpers ──────────────────────────────────────────────────────
+
+// Wait up to timeoutMs for an LP ACK on Serial2 (uses a local parser so the
+// global uartParser state is not disturbed).
+static bool waitUartAckLocal(uint32_t timeoutMs) {
+  lp_stream_parser_t p;
+  lp_stream_init(&p);
+  const uint32_t deadline = millis() + timeoutMs;
+  while (millis() < deadline) {
+    while (Serial2.available()) {
+      lp_frame_t f;
+      if (lp_stream_push(&p, (uint8_t)Serial2.read(), &f) == LP_PARSE_FRAME_OK &&
+          f.header.type == LP_MSG_ACK) {
+        return true;
+      }
+    }
+    delay(1);
+  }
+  return false;
+}
+
+// Wait up to timeoutMs for an LP HELLO on Serial2 (used after RP2040 reboots).
+static bool waitUartHelloLocal(uint32_t timeoutMs) {
+  lp_stream_parser_t p;
+  lp_stream_init(&p);
+  const uint32_t deadline = millis() + timeoutMs;
+  while (millis() < deadline) {
+    while (Serial2.available()) {
+      lp_frame_t f;
+      if (lp_stream_push(&p, (uint8_t)Serial2.read(), &f) == LP_PARSE_FRAME_OK &&
+          f.header.type == LP_MSG_HELLO) {
+        return true;
+      }
+    }
+    delay(5);
+  }
+  return false;
+}
+
+// Stream RP2040 firmware from LittleFS over the UART DFU protocol.
+// Blocks until the transfer completes or fails.
+static bool streamDfuToRp2040() {
+  File f = LittleFS.open(kOtaRp2040Path, "r");
+  if (!f) { Serial.println("[ota] rp2040 bin missing"); return false; }
+  const uint32_t size = f.size();
+  if (size == 0) { f.close(); Serial.println("[ota] rp2040 bin empty"); return false; }
+
+  // LP_MSG_OTA_BEGIN: [size LE4][reserved LE4]
+  uint8_t beginBuf[8];
+  writeU32Le(&beginBuf[0], size);
+  writeU32Le(&beginBuf[4], 0);
+  sendFrameUart(LP_MSG_OTA_BEGIN, beginBuf, 8);
+  Serial.printf("[ota] OTA_BEGIN -> rp2040, %u bytes\n", size);
+
+  if (!waitUartAckLocal(5000)) {
+    f.close();
+    Serial.println("[ota] OTA_BEGIN: no ACK");
+    return false;
+  }
+
+  // Stream DFU chunks: [0xDF][0xC0][offset LE4][len LE2][data][crc16 LE2]
+  uint8_t  chunk[kDfuChunkSize];
+  uint32_t offset = 0;
+  while (offset < size) {
+    const uint32_t rem     = size - offset;
+    const uint16_t clen    = (rem > kDfuChunkSize) ? kDfuChunkSize : (uint16_t)rem;
+    f.seek(offset);
+    if (f.read(chunk, clen) != clen) {
+      Serial.println("[ota] read error"); f.close(); return false;
+    }
+    const uint16_t crc = lp_crc16_ccitt(chunk, clen);
+
+    bool ok = false;
+    for (uint8_t attempt = 0; attempt < kDfuMaxRetries && !ok; attempt++) {
+      const uint8_t hdr[8] = {
+        0xDF, 0xC0,
+        (uint8_t)(offset), (uint8_t)(offset >> 8),
+        (uint8_t)(offset >> 16), (uint8_t)(offset >> 24),
+        (uint8_t)(clen), (uint8_t)(clen >> 8),
+      };
+      const uint8_t crcB[2] = {(uint8_t)(crc), (uint8_t)(crc >> 8)};
+      Serial2.write(hdr, 8);
+      Serial2.write(chunk, clen);
+      Serial2.write(crcB, 2);
+
+      const uint32_t t = millis() + kDfuChunkToutMs;
+      while (millis() < t) {
+        if (Serial2.available()) {
+          const int r = Serial2.read();
+          if (r == kDfuAckByte) { ok = true; break; }
+          if (r == kDfuNakByte) { break; }  // retry
+        }
+        delay(1);
+      }
+    }
+    if (!ok) {
+      Serial.printf("[ota] chunk @%u failed\n", offset);
+      f.close(); return false;
+    }
+    offset += clen;
+    if ((offset & 0x3FFF) == 0) {
+      Serial.printf("[ota] dfu %u/%u bytes\n", offset, size);
+    }
+  }
+  f.close();
+
+  sendFrameUart(LP_MSG_OTA_COMMIT, nullptr, 0);
+  Serial.println("[ota] OTA_COMMIT sent, waiting for reboot...");
+  lp_stream_reset(&uartParser);
+  if (waitUartHelloLocal(12000)) {
+    Serial.println("[ota] rp2040 rebooted OK");
+  } else {
+    Serial.println("[ota] rp2040 reboot timeout");
+  }
+  return true;
+}
+
+// ─── OTA upload handlers ────────────────────────────────────────────────────
+
+// Scan a LittleFS file for the magic prefix "WTPFW:<target>:".
+// Uses overlapping reads so the needle cannot straddle a buffer boundary.
+static bool fsMagicCheck(const char* path, const char* target) {
+  char needle[48];
+  const int nlen = snprintf(needle, sizeof(needle), "WTPFW:%s:", target);
+
+  File f = LittleFS.open(path, "r");
+  if (!f) return false;
+
+  uint8_t buf[560];  // 512 data bytes + up to 47 bytes overlap
+  size_t overlap = 0;
+  bool found = false;
+
+  while (!found && f.available()) {
+    const size_t n = f.read(buf + overlap, 512);
+    const size_t total = overlap + n;
+    for (size_t i = 0; i + (size_t)nlen <= total; i++) {
+      if (memcmp(buf + i, needle, (size_t)nlen) == 0) { found = true; break; }
+    }
+    if (!found && total >= (size_t)(nlen - 1)) {
+      overlap = (size_t)(nlen - 1);
+      memmove(buf, buf + total - overlap, overlap);
+    } else if (!found) {
+      overlap = total;
+    }
+  }
+  f.close();
+  return found;
+}
+
+// Return true if the LittleFS binary at path has the ESP image magic (0xE9)
+// at byte 0 and the given chip_id at bytes [12..13] (little-endian).
+static bool fsChipCheck(const char* path, uint16_t expectedChipId) {
+  File f = LittleFS.open(path, "r");
+  if (!f || f.size() < 14) { if (f) f.close(); return false; }
+  uint8_t hdr[14];
+  f.read(hdr, 14);
+  f.close();
+  if (hdr[0] != 0xE9) return false;
+  const uint16_t chipId = (uint16_t)hdr[12] | ((uint16_t)hdr[13] << 8);
+  return chipId == expectedChipId;
+}
+
+// POST /ota/upload-rp2040
+static void handleOtaRp2040Upload() {
+  HTTPUpload& up = web.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    sOtaError = false;
+    sOtaFile  = LittleFS.open(kOtaRp2040Path, "w");
+    if (!sOtaFile) { sOtaError = true; }
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!sOtaError && sOtaFile &&
+        sOtaFile.write(up.buf, up.currentSize) != up.currentSize) {
+      sOtaError = true;
+    }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (sOtaFile) sOtaFile.close();
+  }
+}
+static void handleOtaRp2040Done() {
+  if (sOtaError) { web.send(500, "text/plain", "upload failed"); return; }
+  // Validate: RP2040 binary must not start with 0xE9 (that would be an ESP image).
+  {
+    File f = LittleFS.open(kOtaRp2040Path, "r");
+    if (!f || f.size() < 1) { if (f) f.close(); web.send(400, "text/plain", "error: empty file"); return; }
+    uint8_t firstByte = 0; f.read(&firstByte, 1); f.close();
+    if (firstByte == 0xE9) {
+      web.send(400, "text/plain", "error: this is an ESP32 binary, not an RP2040 binary");
+      return;
+    }
+  }
+  if (!fsMagicCheck(kOtaRp2040Path, "console-rp2040")) {
+    web.send(400, "text/plain", "error: firmware target mismatch (expected console-rp2040)");
+    return;
+  }
+  web.send(200, "text/plain", "OK: streaming to rp2040...\n");
+  streamDfuToRp2040();
+}
+
+// POST /ota/upload-pad — save binary, trigger TCP OTA_BEGIN
+static void handleOtaPadUpload() {
+  HTTPUpload& up = web.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    sOtaError = false;
+    sOtaFile  = LittleFS.open(kOtaPadPath, "w");
+    if (!sOtaFile) { sOtaError = true; }
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!sOtaError && sOtaFile &&
+        sOtaFile.write(up.buf, up.currentSize) != up.currentSize) {
+      sOtaError = true;
+    }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (sOtaFile) sOtaFile.close();
+  }
+}
+static void handleOtaPadDone() {
+  if (sOtaError) { web.send(500, "text/plain", "upload failed"); return; }
+  if (!fsChipCheck(kOtaPadPath, 0x0002)) {  // 0x0002 = ESP32-S2
+    web.send(400, "text/plain", "error: expected ESP32-S2 binary for pad-esp32");
+    return;
+  }
+  if (!fsMagicCheck(kOtaPadPath, "pad-esp32")) {
+    web.send(400, "text/plain", "error: firmware target mismatch (expected pad-esp32)");
+    return;
+  }
+  File f = LittleFS.open(kOtaPadPath, "r");
+  if (!f) { web.send(500, "text/plain", "bin not found"); return; }
+  const uint32_t size = f.size();
+  f.close();
+  uint8_t beginBuf[8];
+  writeU32Le(&beginBuf[0], size);
+  writeU32Le(&beginBuf[4], 0);
+  if (!sendFrameTcp(LP_MSG_OTA_BEGIN, beginBuf, 8)) {
+    web.send(503, "text/plain", "pad not connected");
+    return;
+  }
+  web.send(200, "text/plain", "OK: pad OTA triggered\n");
+}
+
+// GET /ota/pad-esp32.bin — serve pad binary for HTTPUpdate fetch
+static void handleOtaPadServe() {
+  File f = LittleFS.open(kOtaPadPath, "r");
+  if (!f) { web.send(404, "text/plain", "not found"); return; }
+  web.streamFile(f, "application/octet-stream");
+  f.close();
+}
+
+// POST /ota/upload-console — self-OTA via Update library
+static void handleOtaConsoleUpload() {
+  HTTPUpload& up = web.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    sOtaError            = false;
+    sOtaConsoleValidated = false;
+    // Defer Update.begin() until the first chunk so we can validate the
+    // ESP32 image header (magic 0xE9 + chip_id 0x0000) before committing.
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (sOtaError) return;
+    if (!sOtaConsoleValidated) {
+      // Need at least 14 bytes to read magic + chip_id.
+      if (up.currentSize < 14) {
+        sOtaError = true;
+        Serial.println("[ota] console first chunk too small to validate");
+        return;
+      }
+      if (up.buf[0] != 0xE9) {
+        sOtaError = true;
+        Serial.printf("[ota] bad magic 0x%02x (expected 0xE9)\n", up.buf[0]);
+        return;
+      }
+      const uint16_t chipId = (uint16_t)up.buf[12] | ((uint16_t)up.buf[13] << 8);
+      if (chipId != 0x0000) {  // 0x0000 = ESP32
+        sOtaError = true;
+        Serial.printf("[ota] wrong chip id 0x%04x (expected 0x0000 for ESP32)\n", chipId);
+        return;
+      }
+      sOtaConsoleValidated = true;
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+        sOtaError = true;
+        Serial.printf("[ota] self begin fail: %s\n", Update.errorString());
+        return;
+      }
+    }
+    if (Update.write(up.buf, up.currentSize) != up.currentSize) {
+      sOtaError = true;
+      Serial.printf("[ota] self write fail: %s\n", Update.errorString());
+    }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (!sOtaError && !Update.end(true)) {
+      sOtaError = true;
+      Serial.printf("[ota] self end fail: %s\n", Update.errorString());
+    }
+  }
+}
+static void handleOtaConsoleDone() {
+  if (sOtaError) {
+    const char* errMsg = sOtaConsoleValidated ? Update.errorString() : "binary validation failed";
+    web.send(500, "text/plain", errMsg);
+    return;
+  }
+  web.send(200, "text/plain", "OK: rebooting...\n");
+  delay(500);
+  ESP.restart();
+}
+
+static void handleApiVersions() {
+  char buf[192];
+  snprintf(buf, sizeof(buf),
+    "{\"console_esp32\":\"%s\",\"console_rp2040\":\"%s\",\"pad_esp32\":\"%s\"}",
+    FIRMWARE_VERSION, sRp2040Version, sPadVersion);
+  web.send(200, "application/json", buf);
+}
+
 static void redirectToPortalRoot() {
   web.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
   web.send(302, "text/plain", "");
@@ -1409,6 +1763,12 @@ static void setupCaptivePortal() {
   web.on("/api/tag/program/begin", HTTP_POST, handleApiTagProgramBegin);
   web.on("/api/tag/program/cancel", HTTP_POST, handleApiTagProgramCancel);
   web.on("/api/tag/program/status", HTTP_GET, handleApiTagProgramStatus);
+  web.on("/api/versions", HTTP_GET, handleApiVersions);
+  // OTA firmware update endpoints
+  web.on("/ota/upload-rp2040",  HTTP_POST, handleOtaRp2040Done,   handleOtaRp2040Upload);
+  web.on("/ota/upload-pad",     HTTP_POST, handleOtaPadDone,      handleOtaPadUpload);
+  web.on("/ota/pad-esp32.bin",  HTTP_GET,  handleOtaPadServe);
+  web.on("/ota/upload-console", HTTP_POST, handleOtaConsoleDone,  handleOtaConsoleUpload);
   // Probe URLs used by common client OSes for captive portal detection.
   web.on("/generate_204", HTTP_GET, redirectToPortalRoot);
   web.on("/hotspot-detect.html", HTTP_GET, redirectToPortalRoot);
@@ -1439,16 +1799,23 @@ static bool isValidPadHello(const lp_frame_t& frame) {
     return false;
   }
 
-  // Enrollment request from an uninitialized/reset pad.
+  // Legacy 1-byte enrollment from old pad firmware (no secret bytes).
   if (frame.header.length == 1) {
     return true;
   }
 
-  if (sharedSecret == 0 || frame.header.length != 5) {
-    return false;
+  // New format: 1-byte marker + 4-byte secret + optional version string.
+  // A zero secret means the pad is requesting fresh enrollment.
+  if (frame.header.length < 5) {
+    return false;  // malformed
   }
-
   const uint32_t incomingSecret = readU32Le(&frame.payload[1]);
+  if (incomingSecret == 0) {
+    return true;  // enrollment request
+  }
+  if (sharedSecret == 0) {
+    return false;  // console has no secret — reject non-enrollment
+  }
   return incomingSecret == sharedSecret;
 }
 
@@ -1603,11 +1970,23 @@ static void processTcpIn() {
 
       padPaired = true;
 
-      if (frame.header.length == 1) {
-        // Force a new secret on fresh enrollment.
+      // Enrollment: legacy 1-byte HELLO OR new-format zero secret.
+      const bool isEnrollment =
+          (frame.header.length == 1) ||
+          (frame.header.length >= 5 && readU32Le(&frame.payload[1]) == 0);
+      if (isEnrollment) {
         sharedSecret = 0;
       }
       ensureSecret();
+
+      // Extract pad firmware version (payload[5..length-1] in new format).
+      if (frame.header.length > 5) {
+        const uint8_t vl = frame.header.length - 5;
+        memcpy(sPadVersion, &frame.payload[5], vl);
+        sPadVersion[vl] = '\0';
+      } else {
+        strcpy(sPadVersion, "?");
+      }
       uint8_t pairPayload[4];
       writeU32Le(pairPayload, sharedSecret);
       sendFrameTcp(LP_MSG_PAIR_SET, pairPayload, sizeof(pairPayload));
@@ -1733,6 +2112,16 @@ static void processUartIn() {
         Serial.println(msg);
       }
       continue;
+    }
+
+    if (frame.header.type == LP_MSG_HELLO) {
+      // Extract RP2040 firmware version (payload[1..length-1]).
+      if (frame.header.length > 1) {
+        const uint8_t vl = frame.header.length - 1;
+        memcpy(sRp2040Version, &frame.payload[1], vl);
+        sRp2040Version[vl] = '\0';
+      }
+      continue;  // do not forward HELLO to pad
     }
 
     observeFrameState(frame, false /*fromPad*/);
@@ -1899,6 +2288,7 @@ static void setupAccessPoint() {
 
 void setup() {
   Serial.begin(115200);
+  LittleFS.begin(true);  // mount, format on first use
   Serial2.begin(kRp2040Baud, SERIAL_8N1, 16, 17);
   lp_stream_init(&uartParser);
   loadSecret();

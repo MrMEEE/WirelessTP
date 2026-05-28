@@ -21,6 +21,9 @@ typedef enum {
   LP_MSG_LED_CMD = 0x20,
   LP_MSG_PAIR_SET = 0x30,
   LP_MSG_DEBUG = 0x40,
+  LP_MSG_OTA_BEGIN  = 0x50,  // ESP32→RP2040 (UART): begin DFU, payload=[size LE4][reserved LE4]
+                             // ESP32→pad-esp32 (TCP): trigger HTTP OTA fetch
+  LP_MSG_OTA_COMMIT = 0x51,  // ESP32→RP2040 (UART): all chunks sent, commit and reboot
   LP_MSG_ACK = 0x7f
 } lp_msg_type_t;
 

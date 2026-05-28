@@ -1,0 +1,22 @@
+#pragma once
+// Firmware identification magic embedded in every binary image.
+//
+// Each firmware's main.cpp must declare (non-const so the linker places the
+// string in the initialised-data segment, which is present in the binary):
+//
+//   static char kFwIdent[] = FW_IDENT_STR;
+//
+// OTA upload handlers scan stored binaries for the FW_MAGIC_PREFIX to confirm
+// the correct target before flashing.
+
+#define FW_MAGIC_PREFIX "WTPFW:"
+
+#ifndef FIRMWARE_VERSION
+#  define FIRMWARE_VERSION "dev"
+#endif
+#ifndef FW_TARGET
+#  define FW_TARGET "unknown"
+#endif
+
+// Full identification string: "WTPFW:<target>:<version>"
+#define FW_IDENT_STR FW_MAGIC_PREFIX FW_TARGET ":" FIRMWARE_VERSION

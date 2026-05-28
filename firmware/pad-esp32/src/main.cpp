@@ -17,6 +17,7 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WebServer.h>
+#include <HTTPUpdate.h>
 #include <lwip/sockets.h>  // for direct send() — bypasses WiFiClient::_connected stale-errno
 #include <esp_system.h>        // for esp_reset_reason()
 #include <freertos/FreeRTOS.h>
@@ -31,7 +32,12 @@ extern "C" {
 #endif
 
 #include "link_protocol.h"
+#include "fw_header.h"
 #include "ld_catalog_data.h"
+
+// Non-const so the linker places this string in the .data segment,
+// making it scannable in the binary image for OTA target validation.
+static char kFwIdent[] = FW_IDENT_STR;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 static const char*    kSetupApSsid      = "ToyPad-Setup";
@@ -40,6 +46,8 @@ static const uint16_t kSetupPort        = 80;
 static const uint16_t kDnsPort          = 53;
 static const int      kResetPin         = 0;
 static const uint32_t kResetHoldMs     = 3000;
+// Batman (DC Comics) toy-ID — placing him in center during CONN_BLINK_FAIL reopens setup portal.
+static const uint32_t kGestureResetToyId = 1;
 static const uint16_t kConsolePort     = 25100;
 
 // Forward declaration — defined after startPadWeb().
@@ -991,18 +999,21 @@ static void sendAck(uint8_t seq) {
 }
 
 static void sendHello() {
-  if (sharedSecret == 0) {
-    const uint8_t p[1] = {0xa1};
-    sendFrame(LP_MSG_HELLO, p, 1, true);
-  } else {
-    uint8_t p[5];
-    p[0] = 0xa1;
+  uint8_t p[LP_MAX_PAYLOAD];
+  p[0] = 0xa1;
+  // Always include 4 secret bytes; zero secret signals an enrollment request.
+  if (sharedSecret != 0) {
     p[1] = (uint8_t)(sharedSecret);
     p[2] = (uint8_t)(sharedSecret >> 8);
     p[3] = (uint8_t)(sharedSecret >> 16);
     p[4] = (uint8_t)(sharedSecret >> 24);
-    sendFrame(LP_MSG_HELLO, p, 5, true);
+  } else {
+    p[1] = p[2] = p[3] = p[4] = 0;
   }
+  const size_t rawVerLen = strlen(FIRMWARE_VERSION);
+  const uint8_t verLen = (uint8_t)(rawVerLen < LP_MAX_PAYLOAD - 5 ? rawVerLen : LP_MAX_PAYLOAD - 5);
+  memcpy(&p[5], FIRMWARE_VERSION, verLen);
+  sendFrame(LP_MSG_HELLO, p, 5 + verLen, true);
 }
 
 // ─── Tag forwarding ───────────────────────────────────────────────────────────
@@ -1933,6 +1944,20 @@ static void processTcpIn(uint32_t now) {
     }
 #endif
 
+    // OTA_BEGIN — console-esp32 requests self-update via HTTP fetch
+    if (frame.header.type == LP_MSG_OTA_BEGIN) {
+      sendAck(frame.header.seq);
+      Serial.println("[pad] OTA_BEGIN: starting HTTP update");
+      WiFiClient httpCli;
+      const t_httpUpdate_return ret =
+          httpUpdate.update(httpCli, "http://192.168.44.1/ota/pad-esp32.bin");
+      // HTTP_UPDATE_OK triggers automatic restart; only reached on failure.
+      Serial.printf("[pad] OTA failed (%d): %s\n",
+                    httpUpdate.getLastError(),
+                    httpUpdate.getLastErrorString().c_str());
+      continue;
+    }
+
     // Everything else: ack and ignore
     sendAck(frame.header.seq);
   }
@@ -2062,6 +2087,25 @@ void loop() {
       break;
 
     case CONN_BLINK_FAIL:
+      // While blinking red, check for the gesture-reset trigger:
+      // placing Batman (toyId=1) in the center zone wipes credentials and
+      // reboots into the provisioning portal.
+#if PAD_USB_HOST
+      {
+        TagEvent evt;
+        while (xQueueReceive(sTagQueue, &evt, 0) == pdTRUE) {
+          if (evt.placed && evt.lpZone == 0) {
+            const uint32_t toyId = readPhysicalToyId(evt.uid, evt.padFigIdx);
+            if (toyId == kGestureResetToyId) {
+              Serial.println("[pad] gesture reset: Batman in center → clearing config");
+              clearConfig();
+              delay(100);
+              ESP.restart();
+            }
+          }
+        }
+      }
+#endif  // PAD_USB_HOST
       if (updateBlink(kRR, kRG, kRB)) {
         blinkLastMs  = 0;
         helloStartMs = now;
