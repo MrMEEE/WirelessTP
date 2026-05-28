@@ -715,7 +715,10 @@ static const char kPortalPage[] = R"HTML(
         <div>
           <div style="font-size:.78rem;color:var(--muted);margin-bottom:4px">RP2040 firmware (.bin)</div>
           <form action="/ota/upload-rp2040" enctype="multipart/form-data" onsubmit="event.preventDefault();flashFirmware(this,'st-rp2040')" style="display:flex;gap:6px;align-items:center">
-            <input type="file" name="firmware" accept=".bin" style="flex:1;font-size:.8rem;color:var(--ink);background:#192438;border:1px solid rgba(255,255,255,.2);border-radius:7px;padding:5px 8px">
+            <label style="flex:1;display:flex;align-items:center;background:#192438;border:1px solid rgba(255,255,255,.2);border-radius:7px;padding:6px 10px;cursor:pointer;min-height:36px;box-sizing:border-box">
+              <span id="fn-rp2040" style="font-size:.8rem;color:rgba(255,255,255,.45);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">Choose .bin file…</span>
+              <input type="file" name="firmware" accept=".bin" style="display:none" onchange="document.getElementById('fn-rp2040').textContent=this.files[0]?.name||'Choose .bin file\u2026'">
+            </label>
             <button type="submit" style="border:0;border-radius:8px;background:#3e6acc;color:#fff;font-weight:700;padding:6px 12px;font-size:.8rem;white-space:nowrap">Flash</button>
           </form>
           <div id="st-rp2040" style="font-size:.78rem;margin-top:4px;min-height:1em"></div>
@@ -723,7 +726,10 @@ static const char kPortalPage[] = R"HTML(
         <div>
           <div style="font-size:.78rem;color:var(--muted);margin-bottom:4px">Pad firmware (.bin)</div>
           <form action="/ota/upload-pad" enctype="multipart/form-data" onsubmit="event.preventDefault();flashFirmware(this,'st-pad')" style="display:flex;gap:6px;align-items:center">
-            <input type="file" name="firmware" accept=".bin" style="flex:1;font-size:.8rem;color:var(--ink);background:#192438;border:1px solid rgba(255,255,255,.2);border-radius:7px;padding:5px 8px">
+            <label style="flex:1;display:flex;align-items:center;background:#192438;border:1px solid rgba(255,255,255,.2);border-radius:7px;padding:6px 10px;cursor:pointer;min-height:36px;box-sizing:border-box">
+              <span id="fn-pad" style="font-size:.8rem;color:rgba(255,255,255,.45);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">Choose .bin file…</span>
+              <input type="file" name="firmware" accept=".bin" style="display:none" onchange="document.getElementById('fn-pad').textContent=this.files[0]?.name||'Choose .bin file\u2026'">
+            </label>
             <button type="submit" style="border:0;border-radius:8px;background:#3e6acc;color:#fff;font-weight:700;padding:6px 12px;font-size:.8rem;white-space:nowrap">Flash</button>
           </form>
           <div id="st-pad" style="font-size:.78rem;margin-top:4px;min-height:1em"></div>
@@ -731,7 +737,10 @@ static const char kPortalPage[] = R"HTML(
         <div>
           <div style="font-size:.78rem;color:var(--muted);margin-bottom:4px">Console firmware (.bin) — device will reboot</div>
           <form action="/ota/upload-console" enctype="multipart/form-data" onsubmit="event.preventDefault();flashFirmware(this,'st-console')" style="display:flex;gap:6px;align-items:center">
-            <input type="file" name="firmware" accept=".bin" style="flex:1;font-size:.8rem;color:var(--ink);background:#192438;border:1px solid rgba(255,255,255,.2);border-radius:7px;padding:5px 8px">
+            <label style="flex:1;display:flex;align-items:center;background:#192438;border:1px solid rgba(255,255,255,.2);border-radius:7px;padding:6px 10px;cursor:pointer;min-height:36px;box-sizing:border-box">
+              <span id="fn-console" style="font-size:.8rem;color:rgba(255,255,255,.45);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">Choose .bin file…</span>
+              <input type="file" name="firmware" accept=".bin" style="display:none" onchange="document.getElementById('fn-console').textContent=this.files[0]?.name||'Choose .bin file\u2026'">
+            </label>
             <button type="submit" style="border:0;border-radius:8px;background:#7c3aed;color:#fff;font-weight:700;padding:6px 12px;font-size:.8rem;white-space:nowrap">Flash</button>
           </form>
           <div id="st-console" style="font-size:.78rem;margin-top:4px;min-height:1em"></div>
