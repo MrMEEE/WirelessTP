@@ -1,0 +1,117 @@
+name: Build Firmware
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  build:
+    name: Build all firmware targets
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # PlatformIO package cache: covers toolchains (~500 MB for RP2040 gcc14 +
+      # ~300 MB for ESP32 xtensa) so subsequent runs are fast.
+      # The key covers all platformio.ini files so a dependency change
+      # (new lib version, platform pin) busts the cache.
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-pio-${{ hashFiles('**/platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-
+
+      - name: Install PlatformIO Core
+        run: pip install platformio
+
+      # ── Build targets ──────────────────────────────────────────────────────
+      # Run as separate steps so CI shows per-target pass/fail clearly.
+      # The RP2040 toolchain downloads large gcc14 archives on first run;
+      # subsequent runs are served from the cache above.
+
+      - name: Build console-esp32
+        run: ./build.sh console-esp32
+
+      - name: Build console-rp2040
+        run: ./build.sh console-rp2040
+
+      - name: Build pad-esp32
+        run: ./build.sh pad-esp32
+
+      # ── Assemble firmware package ──────────────────────────────────────────
+      - name: Assemble firmware package
+        run: |
+          mkdir -p dist
+
+          # console-esp32 — ESP32 binary for HTTP OTA self-update
+          cp firmware/console-esp32/.pio/build/console_esp32/firmware.bin \
+             dist/console-esp32.bin
+
+          # console-rp2040 — .gz for UART DFU via LittleFS, .uf2 for manual drag-drop
+          gzip -9 -c firmware/console-rp2040/.pio/build/console_rp2040/firmware.bin \
+            > dist/console-rp2040.bin.gz
+          cp firmware/console-rp2040/.pio/build/console_rp2040/firmware.uf2 \
+             dist/console-rp2040.uf2
+
+          # pad-esp32 — .gz for HTTP OTA via LittleFS
+          gzip -9 -c firmware/pad-esp32/.pio/build/pad_esp32/firmware.bin \
+            > dist/pad-esp32.bin.gz
+
+          # Version manifest so the console-esp32 web UI can show firmware provenance
+          python3 - <<'PYEOF'
+          import json, datetime, os
+          manifest = {
+              "version":  os.environ["GITHUB_REF_NAME"],
+              "sha":      os.environ["GITHUB_SHA"],
+              "ref":      os.environ["GITHUB_REF"],
+              "built_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "files": [
+                  "console-esp32.bin",
+                  "console-rp2040.bin.gz",
+                  "console-rp2040.uf2",
+                  "pad-esp32.bin.gz",
+              ],
+          }
+          with open("dist/manifest.json", "w") as f:
+              json.dump(manifest, f, indent=2)
+              f.write("\n")
+          print("manifest.json written")
+          PYEOF
+
+          echo "=== Package contents ==="
+          ls -lh dist/
+
+      # ── Upload CI artifact (all pushes) ───────────────────────────────────
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.ref_name }}-${{ github.sha }}
+          path: dist/
+          retention-days: 30
+
+      # ── Create GitHub Release (version tags only) ─────────────────────────
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/console-esp32.bin
+            dist/console-rp2040.bin.gz
+            dist/console-rp2040.uf2
+            dist/pad-esp32.bin.gz
+            dist/manifest.json
