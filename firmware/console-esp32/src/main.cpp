@@ -1675,8 +1675,13 @@ static void handleOtaRp2040Done() {
     web.send(400, "text/plain", "error: firmware target mismatch (expected console-rp2040)");
     return;
   }
-  web.send(200, "text/plain", "OK: streaming to rp2040...\n");
-  streamDfuToRp2040();
+  // Stream first, then respond — browser waits for the result rather than
+  // getting "streaming..." immediately with no final status.
+  if (streamDfuToRp2040()) {
+    web.send(200, "text/plain", "OK: rp2040 updated and rebooted");
+  } else {
+    web.send(500, "text/plain", "ERROR: rp2040 DFU failed (check serial log)");
+  }
 }
 
 // POST /ota/upload-pad — save binary, trigger TCP OTA_BEGIN
