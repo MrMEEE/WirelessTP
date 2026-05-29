@@ -1712,6 +1712,7 @@ static void handleOtaPadUpload() {
     Serial.printf("[ota] pad upload done: %u bytes, err=%d\n", up.totalSize, sOtaError);
   }
 }
+static bool streamDfuToPad();  // defined below, after handleOtaPadServe's slot
 static void handleOtaPadDone() {
   if (sOtaError) { web.send(500, "text/plain", "upload failed"); return; }
   if (!fsChipCheck(kOtaPadPath, 0x0002)) {  // 0x0002 = ESP32-S2
@@ -1724,35 +1725,127 @@ static void handleOtaPadDone() {
     web.send(400, "text/plain", "error: firmware target mismatch (expected pad-esp32)");
     return;
   }
+  // Stream first, then respond — browser waits for the result rather than
+  // getting "streaming..." immediately with no final status.
+  if (streamDfuToPad()) {
+    web.send(200, "text/plain", "OK: pad updated and rebooted");
+  } else {
+    web.send(500, "text/plain", "ERROR: pad DFU failed (check serial log)");
+  }
+}
+
+// Wait up to timeoutMs for an LP ACK from the pad via TCP.
+// Forwards any LP_MSG_DEBUG frames it sees to the serial log.
+static bool waitTcpAckLocal(uint32_t timeoutMs) {
+  lp_stream_parser_t p;
+  lp_stream_init(&p);
+  const uint32_t deadline = millis() + timeoutMs;
+  while (millis() < deadline) {
+    while (padClient.available()) {
+      lp_frame_t f;
+      const lp_parse_result_t r = lp_stream_push(&p, (uint8_t)padClient.read(), &f);
+      if (r == LP_PARSE_FRAME_OK) {
+        if (f.header.type == LP_MSG_ACK) return true;
+        if (f.header.type == LP_MSG_DEBUG && f.header.length > 0) {
+          char tmp[LP_MAX_PAYLOAD + 1];
+          memcpy(tmp, f.payload, f.header.length);
+          tmp[f.header.length] = '\0';
+          Serial.printf("[pad-dbg] %s\n", tmp);
+        }
+      }
+    }
+    delay(1);
+  }
+  return false;
+}
+
+// Send LP_MSG_OTA_BEGIN to the pad, then stream the firmware as DFU chunks
+// over the same TCP link.  The pad flashes itself and reboots on success.
+// Wire format per chunk: [0xDF][0xC0][offset LE4][clen LE2][data][crc16 LE2]
+// Response per chunk: 0x06 ACK | 0x15 NAK (pad retransmits on NAK).
+// Blocks until the entire stream is ACK'd or an unrecoverable error occurs.
+static bool streamDfuToPad() {
   File f = LittleFS.open(kOtaPadPath, "r");
-  if (!f) { web.send(500, "text/plain", "bin not found"); return; }
+  if (!f) { Serial.println("[ota] pad bin missing"); return false; }
   const uint32_t size = f.size();
-  f.close();
+  if (size == 0) { f.close(); Serial.println("[ota] pad bin empty"); return false; }
+
+  // LP_MSG_OTA_BEGIN: [size LE4][reserved LE4]
   uint8_t beginBuf[8];
   writeU32Le(&beginBuf[0], size);
   writeU32Le(&beginBuf[4], 0);
   if (!sendFrameTcp(LP_MSG_OTA_BEGIN, beginBuf, 8)) {
+    f.close();
     Serial.println("[ota] pad: TCP send failed — pad not connected");
-    web.send(503, "text/plain", "pad not connected");
-    return;
+    return false;
   }
   Serial.printf("[ota] OTA_BEGIN -> pad, %u bytes\n", size);
-  web.sendHeader("Connection", "close");
-  web.send(200, "text/plain", "OK: pad OTA triggered\n");
-  web.client().stop();  // close browser conn now so port 80 is free for pad's HTTP fetch
-}
 
-// GET /ota/pad-esp32.bin — serve pad binary for HTTPUpdate fetch
-static void handleOtaPadServe() {
-  File f = LittleFS.open(kOtaPadPath, "r");
-  if (!f) { Serial.println("[ota] pad serve: file not found"); web.send(404, "text/plain", "not found"); return; }
-  Serial.printf("[ota] serving pad binary: %u bytes\n", (unsigned)f.size());
-  web.streamFile(f, "application/octet-stream");
-  Serial.println("[ota] pad serve complete");
+  if (!waitTcpAckLocal(5000)) {
+    f.close();
+    Serial.println("[ota] pad: OTA_BEGIN: no ACK from pad");
+    return false;
+  }
+  Serial.println("[ota] pad: OTA_BEGIN ACK'd — streaming DFU chunks");
+
+  uint8_t  chunk[kDfuChunkSize];
+  uint32_t offset = 0;
+  while (offset < size) {
+    const uint32_t rem  = size - offset;
+    const uint16_t clen = (rem > kDfuChunkSize) ? kDfuChunkSize : (uint16_t)rem;
+    f.seek(offset);
+    if (f.read(chunk, clen) != clen) {
+      Serial.println("[ota] pad: LittleFS read error");
+      f.close();
+      return false;
+    }
+    const uint16_t crc = lp_crc16_ccitt(chunk, clen);
+
+    bool ok = false;
+    for (uint8_t attempt = 0; attempt < kDfuMaxRetries && !ok; attempt++) {
+      const uint8_t hdr[8] = {
+        0xDF, 0xC0,
+        (uint8_t)(offset),        (uint8_t)(offset >> 8),
+        (uint8_t)(offset >> 16),  (uint8_t)(offset >> 24),
+        (uint8_t)(clen),          (uint8_t)(clen >> 8),
+      };
+      const uint8_t crcB[2] = { (uint8_t)(crc), (uint8_t)(crc >> 8) };
+      const int fd = padClient.fd();
+      if (fd < 0) {
+        Serial.println("[ota] pad: disconnected during DFU");
+        f.close();
+        return false;
+      }
+      ::send(fd, hdr,   sizeof(hdr), 0);
+      ::send(fd, chunk, clen,        0);
+      ::send(fd, crcB,  sizeof(crcB), 0);
+
+      const uint32_t t = millis() + kDfuChunkToutMs;
+      while (millis() < t) {
+        if (padClient.available()) {
+          const int r = padClient.read();
+          if (r == kDfuAckByte) { ok = true; break; }
+          if (r == kDfuNakByte) { break; }  // retry
+        }
+        delay(1);
+      }
+    }
+
+    if (!ok) {
+      Serial.printf("[ota] pad: chunk @%u failed\n", offset);
+      f.close();
+      return false;
+    }
+    offset += clen;
+    if ((offset % (64 * 1024)) == 0 || offset == size) {
+      Serial.printf("[ota] pad dfu %u/%u bytes\n", offset, size);
+    }
+  }
   f.close();
+  Serial.println("[ota] pad: DFU stream complete — pad is rebooting");
+  return true;
 }
 
-// POST /ota/upload-console — self-OTA via Update library
 static void handleOtaConsoleUpload() {
   HTTPUpload& up = web.upload();
   if (up.status == UPLOAD_FILE_START) {
@@ -1844,7 +1937,6 @@ static void setupCaptivePortal() {
   // OTA firmware update endpoints
   web.on("/ota/upload-rp2040",  HTTP_POST, handleOtaRp2040Done,   handleOtaRp2040Upload);
   web.on("/ota/upload-pad",     HTTP_POST, handleOtaPadDone,      handleOtaPadUpload);
-  web.on("/ota/pad-esp32.bin",  HTTP_GET,  handleOtaPadServe);
   web.on("/ota/upload-console", HTTP_POST, handleOtaConsoleDone,  handleOtaConsoleUpload);
   // Probe URLs used by common client OSes for captive portal detection.
   web.on("/generate_204", HTTP_GET, redirectToPortalRoot);

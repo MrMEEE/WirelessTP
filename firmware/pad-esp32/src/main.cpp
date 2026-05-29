@@ -17,7 +17,7 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WebServer.h>
-#include <HTTPUpdate.h>
+#include <Update.h>
 #include <lwip/sockets.h>  // for direct send() — bypasses WiFiClient::_connected stale-errno
 #include <esp_system.h>        // for esp_reset_reason()
 #include <freertos/FreeRTOS.h>
@@ -55,6 +55,12 @@ static void serviceFactoryReset();
 static const uint32_t kRetryMs         = 50;
 static const uint8_t  kMaxRetries      = 3;
 static const uint32_t kHelloMs         = 2000;   // HELLO interval while searching
+
+// DFU push-OTA constants (must match console-esp32 values)
+static const uint16_t kDfuChunkSize    = 1024;
+static const uint8_t  kDfuAckByte      = 0x06;
+static const uint8_t  kDfuNakByte      = 0x15;
+static const uint32_t kDfuChunkToutMs  = 10000;  // 10 s per chunk
 static const uint32_t kPairTimeoutMs   = 15000;  // give up pairing after 15 s
 static const uint32_t kHeartbeatMs     = 5000;   // HELLO interval while paired
 static const uint32_t kLostMs          = 30000;  // assume console gone after 30 s
@@ -1838,6 +1844,120 @@ static void serviceFactoryReset() {
   }
 }
 
+// ─── DFU push-OTA receiver ────────────────────────────────────────────────────
+// Receives a DFU stream from the console over the existing TCP link.
+// Wire format (per chunk): [0xDF][0xC0][offset LE4][clen LE2][data clen][crc16 LE2]
+// Response per chunk: 0x06 ACK or 0x15 NAK.
+// Called from inside processTcpIn after receiving LP_MSG_OTA_BEGIN.
+// On success: calls Update.end(true) + ESP.restart() — never returns.
+// On failure: returns so the caller can continue the LP frame loop normally.
+static void receiveDfuStream(uint32_t fwSize) {
+  Serial.printf("[pad] DFU: begin, expecting %u bytes\n", fwSize);
+  if (!Update.begin(fwSize, U_FLASH)) {
+    Serial.printf("[pad] DFU: Update.begin failed err=%d\n", Update.getError());
+    return;
+  }
+
+  uint32_t written = 0;
+  uint8_t  chunk[kDfuChunkSize];
+
+  while (written < fwSize) {
+    // ── Read chunk header: 0xDF 0xC0 [offset LE4] [clen LE2] ────────────────
+    uint8_t  hdr[8];
+    uint8_t  hdrPos = 0;
+    const uint32_t hdrDeadline = millis() + kDfuChunkToutMs;
+    while (hdrPos < 8 && millis() < hdrDeadline) {
+      if (client.available()) { hdr[hdrPos++] = (uint8_t)client.read(); }
+      else                    { yield(); }
+    }
+    if (hdrPos < 8) {
+      Serial.printf("[pad] DFU: header timeout at %u/%u\n", written, fwSize);
+      break;
+    }
+    if (hdr[0] != 0xDF || hdr[1] != 0xC0) {
+      Serial.printf("[pad] DFU: bad magic 0x%02X 0x%02X at %u\n", hdr[0], hdr[1], written);
+      break;
+    }
+    const uint16_t clen = (uint16_t)hdr[6] | ((uint16_t)hdr[7] << 8);
+    if (clen == 0 || clen > kDfuChunkSize) {
+      Serial.printf("[pad] DFU: bad chunk len %u at %u\n", clen, written);
+      break;
+    }
+
+    // ── Read data ────────────────────────────────────────────────────────────
+    uint16_t dataPos = 0;
+    const uint32_t dataDeadline = millis() + kDfuChunkToutMs;
+    while (dataPos < clen && millis() < dataDeadline) {
+      if (client.available()) { chunk[dataPos++] = (uint8_t)client.read(); }
+      else                    { yield(); }
+    }
+    if (dataPos < clen) {
+      Serial.printf("[pad] DFU: data timeout at %u/%u\n", written, fwSize);
+      break;
+    }
+
+    // ── Read CRC ─────────────────────────────────────────────────────────────
+    uint8_t  crcB[2];
+    uint8_t  crcPos = 0;
+    const uint32_t crcDeadline = millis() + 2000;
+    while (crcPos < 2 && millis() < crcDeadline) {
+      if (client.available()) { crcB[crcPos++] = (uint8_t)client.read(); }
+      else                    { yield(); }
+    }
+    if (crcPos < 2) {
+      Serial.printf("[pad] DFU: CRC timeout at %u/%u\n", written, fwSize);
+      break;
+    }
+
+    // ── Verify CRC ───────────────────────────────────────────────────────────
+    const uint16_t rxCrc   = (uint16_t)crcB[0] | ((uint16_t)crcB[1] << 8);
+    const uint16_t calcCrc = lp_crc16_ccitt(chunk, clen);
+    if (rxCrc != calcCrc) {
+      Serial.printf("[pad] DFU: CRC mismatch at %u: got 0x%04X expected 0x%04X\n",
+                    written, rxCrc, calcCrc);
+      const uint8_t nak = kDfuNakByte;
+      const int fd = client.fd();
+      if (fd >= 0) ::send(fd, &nak, 1, MSG_DONTWAIT);
+      continue;  // wait for console to retransmit this chunk
+    }
+
+    // ── Write to OTA partition ───────────────────────────────────────────────
+    const size_t wrote = Update.write(chunk, clen);
+    if (wrote != clen) {
+      Serial.printf("[pad] DFU: Update.write failed at %u: wrote=%u err=%d\n",
+                    written, (unsigned)wrote, Update.getError());
+      const uint8_t nak = kDfuNakByte;
+      const int fd = client.fd();
+      if (fd >= 0) ::send(fd, &nak, 1, MSG_DONTWAIT);
+      break;
+    }
+
+    // ── ACK ──────────────────────────────────────────────────────────────────
+    {
+      const uint8_t ack = kDfuAckByte;
+      const int fd = client.fd();
+      if (fd >= 0) ::send(fd, &ack, 1, MSG_DONTWAIT);
+    }
+    written += clen;
+    if ((written % (64 * 1024)) == 0 || written == fwSize) {
+      Serial.printf("[pad] DFU: %u/%u bytes\n", written, fwSize);
+    }
+  }
+
+  if (written == fwSize) {
+    if (Update.end(true)) {
+      Serial.println("[pad] DFU complete \u2014 rebooting");
+      delay(100);
+      ESP.restart();
+    } else {
+      Serial.printf("[pad] DFU: Update.end failed err=%d\n", Update.getError());
+    }
+  } else {
+    Update.abort();
+    Serial.printf("[pad] DFU: aborted at %u/%u bytes\n", written, fwSize);
+  }
+}
+
 // ─── TCP receive ──────────────────────────────────────────────────────────────
 static void processTcpIn(uint32_t now) {
   // No client.connected() check — available() returns 0 when not connected so
@@ -1944,28 +2064,17 @@ static void processTcpIn(uint32_t now) {
     }
 #endif
 
-    // OTA_BEGIN — console-esp32 requests self-update via HTTP fetch
+    // OTA_BEGIN — console-esp32 pushes firmware via DFU stream on this TCP link
     if (frame.header.type == LP_MSG_OTA_BEGIN) {
+      const uint32_t fwSize =
+          (uint32_t)frame.payload[0]         |
+          ((uint32_t)frame.payload[1] << 8)  |
+          ((uint32_t)frame.payload[2] << 16) |
+          ((uint32_t)frame.payload[3] << 24);
       sendAck(frame.header.seq);
-      Serial.println("[pad] OTA_BEGIN: starting HTTP update");
-      {
-        const char* msg = "ota: starting";
-        sendFrame(LP_MSG_DEBUG, (const uint8_t*)msg, strlen(msg), false);
-      }
-      WiFiClient httpCli;
-      const t_httpUpdate_return ret =
-          httpUpdate.update(httpCli, "http://192.168.44.1/ota/pad-esp32.bin");
-      // HTTP_UPDATE_OK triggers automatic restart; only reached on failure.
-      {
-        char dbg[LP_MAX_PAYLOAD];
-        snprintf(dbg, sizeof(dbg), "ota fail err=%d: %s",
-                 (int)httpUpdate.getLastError(),
-                 httpUpdate.getLastErrorString().c_str());
-        sendFrame(LP_MSG_DEBUG, (const uint8_t*)dbg, strlen(dbg), false);
-      }
-      Serial.printf("[pad] OTA failed (%d): %s\n",
-                    httpUpdate.getLastError(),
-                    httpUpdate.getLastErrorString().c_str());
+      Serial.printf("[pad] OTA_BEGIN: %u bytes — entering DFU receiver\n", fwSize);
+      receiveDfuStream(fwSize);  // reboots on success; returns on failure
+      Serial.println("[pad] DFU failed — resuming normal operation");
       continue;
     }
 
