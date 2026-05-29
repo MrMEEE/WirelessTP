@@ -42,6 +42,16 @@ jobs:
       # The RP2040 toolchain downloads large gcc14 archives on first run;
       # subsequent runs are served from the cache above.
 
+      - name: Set firmware version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(cat version.txt 2>/dev/null || echo dev)"
+          fi
+          echo "FIRMWARE_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Building with FIRMWARE_VERSION=$VERSION"
+
       - name: Build console-esp32
         run: ./build.sh console-esp32
 
@@ -56,28 +66,37 @@ jobs:
         run: |
           mkdir -p dist
 
+          # Use the tag version (vX.Y.Z → X.Y.Z) for tag builds, otherwise the
+          # short SHA so PR/branch artifacts are still uniquely named.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER="$(git rev-parse --short HEAD)"
+          fi
+
           # All three targets shipped as raw .bin — upload directly via web UI OTA
           cp firmware/console-esp32/.pio/build/console_esp32/firmware.bin \
-             dist/console-esp32.bin
+             "dist/console-esp32-${VER}.bin"
 
           cp firmware/console-rp2040/.pio/build/console_rp2040/firmware.bin \
-             dist/console-rp2040.bin
+             "dist/console-rp2040-${VER}.bin"
 
           cp firmware/pad-esp32/.pio/build/pad_esp32/firmware.bin \
-             dist/pad-esp32.bin
+             "dist/pad-esp32-${VER}.bin"
 
           # Version manifest so the console-esp32 web UI can show firmware provenance
           python3 - <<'PYEOF'
           import json, datetime, os
+          ver = os.environ.get("FIRMWARE_VERSION", "dev")
           manifest = {
-              "version":  os.environ["GITHUB_REF_NAME"],
+              "version":  ver,
               "sha":      os.environ["GITHUB_SHA"],
               "ref":      os.environ["GITHUB_REF"],
               "built_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
               "files": [
-                  "console-esp32.bin",
-                  "console-rp2040.bin",
-                  "pad-esp32.bin",
+                  f"console-esp32-{ver}.bin",
+                  f"console-rp2040-{ver}.bin",
+                  f"pad-esp32-{ver}.bin",
               ],
           }
           with open("dist/manifest.json", "w") as f:
@@ -107,7 +126,7 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: |
-            dist/console-esp32.bin
-            dist/console-rp2040.bin
-            dist/pad-esp32.bin
+            dist/console-esp32-*.bin
+            dist/console-rp2040-*.bin
+            dist/pad-esp32-*.bin
             dist/manifest.json
