@@ -1743,8 +1743,10 @@ static void handleOtaPadDone() {
 // GET /ota/pad-esp32.bin — serve pad binary for HTTPUpdate fetch
 static void handleOtaPadServe() {
   File f = LittleFS.open(kOtaPadPath, "r");
-  if (!f) { web.send(404, "text/plain", "not found"); return; }
+  if (!f) { Serial.println("[ota] pad serve: file not found"); web.send(404, "text/plain", "not found"); return; }
+  Serial.printf("[ota] serving pad binary: %u bytes\n", (unsigned)f.size());
   web.streamFile(f, "application/octet-stream");
+  Serial.println("[ota] pad serve complete");
   f.close();
 }
 
