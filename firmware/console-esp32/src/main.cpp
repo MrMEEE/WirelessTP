@@ -691,12 +691,27 @@ static const char kPortalPage[] = R"HTML(
       const el = document.getElementById(statusId);
       const fi = formEl.querySelector('input[type=file]');
       if (!fi.files.length) { el.style.color='var(--muted)'; el.textContent='Select a .bin file first'; return; }
-      el.style.color='var(--muted)'; el.textContent='Uploading…';
+      el.style.color='var(--muted)'; el.textContent='Uploading\u2026';
       try {
         const r = await fetch(formEl.action, { method:'POST', body:new FormData(formEl) });
         const t = await r.text();
         el.style.color = r.ok ? '#4ade80' : '#f87171';
         el.textContent = t;
+        if (r.ok) {
+          if (t.includes('reboot')) {
+            // Console self-OTA: device reboots — poll until it's back, then reload.
+            el.textContent += ' Waiting for device\u2026';
+            const deadline = Date.now() + 30000;
+            while (Date.now() < deadline) {
+              await new Promise(res => setTimeout(res, 2000));
+              try { await fetch('/api/state', { signal: AbortSignal.timeout(2000) }); break; } catch {}
+            }
+          } else {
+            // RP2040 / pad: console stays up; short delay so the user can read the result.
+            await new Promise(res => setTimeout(res, 2000));
+          }
+          location.reload();
+        }
       } catch(e) {
         el.style.color='#f87171';
         el.textContent='Upload failed: '+e.message;
