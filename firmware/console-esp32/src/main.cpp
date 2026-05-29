@@ -1756,9 +1756,16 @@ static bool waitTcpAckLocal(uint32_t timeoutMs) {
   lp_stream_init(&p);
   const uint32_t deadline = millis() + timeoutMs;
   while (millis() < deadline) {
-    while (padClient.available()) {
+    const int fd = padClient.fd();
+    if (fd < 0) break;  // socket gone
+    uint8_t b;
+    // Use ::recv() directly to bypass WiFiClient's _connected / _rxBuffer state,
+    // which can be set to false by a stale lwIP errno in _fillBuffer(), causing
+    // available() to return 0 even while the kernel socket buffer has data.
+    const int n = ::recv(fd, &b, 1, MSG_DONTWAIT);
+    if (n == 1) {
       lp_frame_t f;
-      const lp_parse_result_t r = lp_stream_push(&p, (uint8_t)padClient.read(), &f);
+      const lp_parse_result_t r = lp_stream_push(&p, b, &f);
       if (r == LP_PARSE_FRAME_OK) {
         if (f.header.type == LP_MSG_ACK) return true;
         if (f.header.type == LP_MSG_DEBUG && f.header.length > 0) {
@@ -1768,8 +1775,9 @@ static bool waitTcpAckLocal(uint32_t timeoutMs) {
           Serial.printf("[pad-dbg] %s\n", tmp);
         }
       }
+    } else {
+      delay(1);
     }
-    delay(1);
   }
   return false;
 }
@@ -1837,12 +1845,16 @@ static bool streamDfuToPad() {
 
       const uint32_t t = millis() + kDfuChunkToutMs;
       while (millis() < t) {
-        if (padClient.available()) {
-          const int r = padClient.read();
-          if (r == kDfuAckByte) { ok = true; break; }
-          if (r == kDfuNakByte) { break; }  // retry
+        const int fd2 = padClient.fd();
+        if (fd2 < 0) break;  // socket gone
+        uint8_t rb;
+        const int rn = ::recv(fd2, &rb, 1, MSG_DONTWAIT);
+        if (rn == 1) {
+          if (rb == kDfuAckByte) { ok = true; break; }
+          if (rb == kDfuNakByte) { break; }  // retry
+        } else {
+          delay(1);
         }
-        delay(1);
       }
     }
 
