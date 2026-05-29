@@ -688,7 +688,13 @@ static const char kPortalPage[] = R"HTML(
         const set = (id, val) => { const e = document.getElementById(id); if (e) e.textContent = val || "?"; };
         set("fv-console", v.console_esp32);
         set("fv-rp2040",  v.console_rp2040);
-        set("fv-pad",     v.pad_esp32);
+        set("fv-pad",     v.pad_connected ? v.pad_esp32 : '\u2014');
+        const padBtn = document.getElementById('btn-flash-pad');
+        if (padBtn) {
+          padBtn.disabled       = !v.pad_connected;
+          padBtn.style.opacity  = v.pad_connected ? '' : '0.4';
+          padBtn.style.cursor   = v.pad_connected ? '' : 'not-allowed';
+        }
       } catch(_) {}
     }
     refreshVersions();
@@ -753,7 +759,7 @@ static const char kPortalPage[] = R"HTML(
               <span id="fn-pad" style="font-size:.8rem;color:rgba(255,255,255,.45);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">Choose .bin file…</span>
               <input type="file" name="firmware" accept=".bin" style="display:none" onchange="document.getElementById('fn-pad').textContent=this.files[0]?.name||'Choose .bin file\u2026'">
             </label>
-            <button type="submit" style="border:0;border-radius:8px;background:#3e6acc;color:#fff;font-weight:700;padding:6px 12px;font-size:.8rem;white-space:nowrap">Flash</button>
+            <button id="btn-flash-pad" type="submit" style="border:0;border-radius:8px;background:#3e6acc;color:#fff;font-weight:700;padding:6px 12px;font-size:.8rem;white-space:nowrap">Flash</button>
           </form>
           <div id="st-pad" style="font-size:.78rem;margin-top:4px;min-height:1em"></div>
         </div>
@@ -1940,10 +1946,11 @@ static void handleOtaConsoleDone() {
 }
 
 static void handleApiVersions() {
-  char buf[192];
+  char buf[224];
   snprintf(buf, sizeof(buf),
-    "{\"console_esp32\":\"%s\",\"console_rp2040\":\"%s\",\"pad_esp32\":\"%s\"}",
-    FIRMWARE_VERSION, sRp2040Version, sPadVersion);
+    "{\"console_esp32\":\"%s\",\"console_rp2040\":\"%s\",\"pad_esp32\":\"%s\",\"pad_connected\":%s}",
+    FIRMWARE_VERSION, sRp2040Version, sPadVersion,
+    padClient.fd() >= 0 ? "true" : "false");
   web.send(200, "application/json", buf);
 }
 
