@@ -1697,25 +1697,30 @@ static void handleOtaRp2040Done() {
 static void handleOtaPadUpload() {
   HTTPUpload& up = web.upload();
   if (up.status == UPLOAD_FILE_START) {
+    Serial.println("[ota] pad upload start");
     sOtaError = false;
     sOtaFile  = LittleFS.open(kOtaPadPath, "w");
-    if (!sOtaFile) { sOtaError = true; }
+    if (!sOtaFile) { sOtaError = true; Serial.println("[ota] pad: LittleFS open failed"); }
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (!sOtaError && sOtaFile &&
         sOtaFile.write(up.buf, up.currentSize) != up.currentSize) {
       sOtaError = true;
+      Serial.println("[ota] pad: write error");
     }
   } else if (up.status == UPLOAD_FILE_END) {
     if (sOtaFile) sOtaFile.close();
+    Serial.printf("[ota] pad upload done: %u bytes, err=%d\n", up.totalSize, sOtaError);
   }
 }
 static void handleOtaPadDone() {
   if (sOtaError) { web.send(500, "text/plain", "upload failed"); return; }
   if (!fsChipCheck(kOtaPadPath, 0x0002)) {  // 0x0002 = ESP32-S2
+    Serial.println("[ota] pad: chip ID check failed (not ESP32-S2)");
     web.send(400, "text/plain", "error: expected ESP32-S2 binary for pad-esp32");
     return;
   }
   if (!fsMagicCheck(kOtaPadPath, "pad-esp32")) {
+    Serial.println("[ota] pad: magic check failed (missing WTPFW:pad-esp32: ident)");
     web.send(400, "text/plain", "error: firmware target mismatch (expected pad-esp32)");
     return;
   }
@@ -1727,9 +1732,11 @@ static void handleOtaPadDone() {
   writeU32Le(&beginBuf[0], size);
   writeU32Le(&beginBuf[4], 0);
   if (!sendFrameTcp(LP_MSG_OTA_BEGIN, beginBuf, 8)) {
+    Serial.println("[ota] pad: TCP send failed — pad not connected");
     web.send(503, "text/plain", "pad not connected");
     return;
   }
+  Serial.printf("[ota] OTA_BEGIN -> pad, %u bytes\n", size);
   web.send(200, "text/plain", "OK: pad OTA triggered\n");
 }
 
