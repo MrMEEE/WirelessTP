@@ -9,6 +9,7 @@
 #include <LittleFS.h>
 #include <Update.h>
 
+#include <esp_netif.h>    // for esp_netif_dhcps_option (short DHCP lease time)
 #include <lwip/sockets.h>  // for direct ::send() — bypasses WiFiClient::_connected stale-errno
 #include "link_protocol.h"
 #include "fw_header.h"
@@ -2328,6 +2329,20 @@ static void setupAccessPoint() {
                     IPAddress(192, 168, 44, 1),
                     IPAddress(255, 255, 255, 0));
   WiFi.softAP(apSsid.c_str(), nullptr, 1, 0, 8);  // open, ch1, visible, max 8 stations
+
+  // Shorten DHCP lease time to 2 minutes. The default is ~2 hours, which means
+  // stale leases from previous reconnects accumulate and exhaust the 8-slot pool.
+  {
+    esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap_netif) {
+      esp_netif_dhcps_stop(ap_netif);
+      uint32_t lease_minutes = 2;
+      esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
+                             ESP_NETIF_IP_ADDRESS_LEASE_TIME,
+                             &lease_minutes, sizeof(lease_minutes));
+      esp_netif_dhcps_start(ap_netif);
+    }
+  }
 
   Serial.print("[console-esp32] AP SSID (open): ");
   Serial.println(apSsid);
