@@ -1492,9 +1492,18 @@ static bool waitUartAckLocal(uint32_t timeoutMs) {
   while (millis() < deadline) {
     while (Serial2.available()) {
       lp_frame_t f;
-      if (lp_stream_push(&p, (uint8_t)Serial2.read(), &f) == LP_PARSE_FRAME_OK &&
-          f.header.type == LP_MSG_ACK) {
-        return true;
+      const lp_parse_result_t r = lp_stream_push(&p, (uint8_t)Serial2.read(), &f);
+      if (r == LP_PARSE_FRAME_OK) {
+        if (f.header.type == LP_MSG_ACK) {
+          return true;
+        }
+        // Forward RP2040 debug messages so errors aren't silently swallowed.
+        if (f.header.type == LP_MSG_DEBUG && f.header.length > 0) {
+          char tmp[LP_MAX_PAYLOAD + 1];
+          memcpy(tmp, f.payload, f.header.length);
+          tmp[f.header.length] = '\0';
+          Serial.printf("[rp2040] %s\n", tmp);
+        }
       }
     }
     delay(1);
