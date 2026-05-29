@@ -1948,10 +1948,21 @@ static void processTcpIn(uint32_t now) {
     if (frame.header.type == LP_MSG_OTA_BEGIN) {
       sendAck(frame.header.seq);
       Serial.println("[pad] OTA_BEGIN: starting HTTP update");
+      {
+        const char* msg = "ota: starting";
+        sendFrame(LP_MSG_DEBUG, (const uint8_t*)msg, strlen(msg), false);
+      }
       WiFiClient httpCli;
       const t_httpUpdate_return ret =
           httpUpdate.update(httpCli, "http://192.168.44.1/ota/pad-esp32.bin");
       // HTTP_UPDATE_OK triggers automatic restart; only reached on failure.
+      {
+        char dbg[LP_MAX_PAYLOAD];
+        snprintf(dbg, sizeof(dbg), "ota fail err=%d: %s",
+                 (int)httpUpdate.getLastError(),
+                 httpUpdate.getLastErrorString().c_str());
+        sendFrame(LP_MSG_DEBUG, (const uint8_t*)dbg, strlen(dbg), false);
+      }
       Serial.printf("[pad] OTA failed (%d): %s\n",
                     httpUpdate.getLastError(),
                     httpUpdate.getLastErrorString().c_str());
