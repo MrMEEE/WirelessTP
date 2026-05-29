@@ -1737,7 +1737,9 @@ static void handleOtaPadDone() {
     return;
   }
   Serial.printf("[ota] OTA_BEGIN -> pad, %u bytes\n", size);
+  web.sendHeader("Connection", "close");
   web.send(200, "text/plain", "OK: pad OTA triggered\n");
+  web.client().stop();  // close browser conn now so port 80 is free for pad's HTTP fetch
 }
 
 // GET /ota/pad-esp32.bin — serve pad binary for HTTPUpdate fetch
