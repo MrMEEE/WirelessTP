@@ -117,7 +117,6 @@ AnsiFilterState piAnsiState = ANSI_NORMAL;
 
 // ─── OTA / DFU ──────────────────────────────────────────────────────────────
 static const char*    kOtaRp2040Path   = "/ota-rp2040.bin";
-static const char*    kOtaPadPath      = "/ota-pad.bin";
 static const uint16_t kDfuChunkSize    = 1024;
 static const uint8_t  kDfuAckByte      = 0x06;
 static const uint8_t  kDfuNakByte      = 0x15;
@@ -127,6 +126,12 @@ static const uint8_t  kDfuMaxRetries   = 3;
 static File sOtaFile;
 static bool sOtaError = false;
 static bool sOtaConsoleValidated = false;
+// Streaming-DFU state: the pad firmware is sent directly to the pad over TCP
+// during the HTTP upload, eliminating LittleFS staging and the blocking write.
+static uint8_t  sDfuStreamBuf[kDfuChunkSize];  // 1 KB DFU chunk accumulator
+static uint16_t sDfuStreamPos    = 0;           // bytes filled in sDfuStreamBuf
+static uint32_t sDfuStreamOff    = 0;           // byte offset of next DFU chunk
+static bool     sDfuStreamActive = false;       // true after OTA_BEGIN is ACK'd
 static char sRp2040Version[LP_MAX_PAYLOAD + 1] = "?";
 static char sPadVersion[LP_MAX_PAYLOAD + 1]    = "?";
 // Non-const so the linker places this string in the .data segment,
@@ -141,6 +146,7 @@ static bool sendFrameUart(uint8_t type, const uint8_t* payload, uint8_t payloadL
                           uint8_t forceSeq = 0xff);
 static bool sendFrameTcp(uint8_t type, const uint8_t* payload, uint8_t payloadLen,
                          uint8_t forceSeq = 0xff);
+static bool waitTcpAckLocal(uint32_t timeoutMs);
 
 static const char* toyTypeToString(uint8_t toyType);
 static uint8_t toyTypeFromString(const String& s);
@@ -693,7 +699,8 @@ static const char kPortalPage[] = R"HTML(
       if (!fi.files.length) { el.style.color='var(--muted)'; el.textContent='Select a .bin file first'; return; }
       el.style.color='var(--muted)'; el.textContent='Uploading\u2026';
       try {
-        const r = await fetch(formEl.action, { method:'POST', body:new FormData(formEl) });
+        const url = formEl.action + '?size=' + fi.files[0].size;
+        const r = await fetch(url, { method:'POST', body:new FormData(formEl) });
         const t = await r.text();
         el.style.color = r.ok ? '#4ade80' : '#f87171';
         el.textContent = t;
@@ -1708,44 +1715,137 @@ static void handleOtaRp2040Done() {
   }
 }
 
-// POST /ota/upload-pad — save binary, trigger TCP OTA_BEGIN
+// Send one DFU chunk [0xDF 0xC0 offset[4] clen[2] data crc16[2]] and wait
+// for a 0x06 ACK from the pad.  Retries up to kDfuMaxRetries times.
+static bool sendOneDfuChunk(uint32_t offset, const uint8_t* data, uint16_t clen) {
+  const uint16_t crc  = lp_crc16_ccitt(data, clen);
+  const uint8_t  crcB[2] = { (uint8_t)(crc), (uint8_t)(crc >> 8) };
+  for (uint8_t attempt = 0; attempt < kDfuMaxRetries; attempt++) {
+    const uint8_t hdr[8] = {
+      0xDF, 0xC0,
+      (uint8_t)(offset),        (uint8_t)(offset >> 8),
+      (uint8_t)(offset >> 16),  (uint8_t)(offset >> 24),
+      (uint8_t)(clen),          (uint8_t)(clen >> 8),
+    };
+    const int fd = padClient.fd();
+    if (fd < 0) return false;
+    ::send(fd, hdr,  sizeof(hdr), 0);
+    ::send(fd, data, clen,        0);
+    ::send(fd, crcB, sizeof(crcB), 0);
+    const uint32_t t = millis() + kDfuChunkToutMs;
+    while (millis() < t) {
+      const int fd2 = padClient.fd();
+      if (fd2 < 0) break;
+      uint8_t rb;
+      if (::recv(fd2, &rb, 1, MSG_DONTWAIT) == 1) {
+        if (rb == kDfuAckByte) return true;
+        if (rb == kDfuNakByte) break;  // NAK → retry
+      } else {
+        delay(1);
+      }
+    }
+  }
+  return false;
+}
+
+// POST /ota/upload-pad — stream firmware bytes directly to the pad as DFU
+// chunks while the browser upload is still in progress.  No LittleFS staging.
+// The browser must include ?size=<filesize> so we can send LP_MSG_OTA_BEGIN
+// with the correct total size before the first data chunk arrives.
 static void handleOtaPadUpload() {
   HTTPUpload& up = web.upload();
   if (up.status == UPLOAD_FILE_START) {
-    Serial.println("[ota] pad upload start");
-    sOtaError = false;
-    sOtaFile  = LittleFS.open(kOtaPadPath, "w");
-    if (!sOtaFile) { sOtaError = true; Serial.println("[ota] pad: LittleFS open failed"); }
-  } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (!sOtaError && sOtaFile &&
-        sOtaFile.write(up.buf, up.currentSize) != up.currentSize) {
+    sOtaError        = false;
+    sDfuStreamActive = false;
+    sDfuStreamPos    = 0;
+    sDfuStreamOff    = 0;
+    const uint32_t fwSize = (uint32_t)web.arg("size").toInt();
+    if (fwSize == 0) {
       sOtaError = true;
-      Serial.println("[ota] pad: write error");
+      Serial.println("[ota] pad: missing ?size= in URL");
+      return;
+    }
+    if (padClient.fd() < 0) {
+      sOtaError = true;
+      Serial.println("[ota] pad: pad not connected");
+      return;
+    }
+    uint8_t beginBuf[8];
+    writeU32Le(&beginBuf[0], fwSize);
+    writeU32Le(&beginBuf[4], 0);
+    if (!sendFrameTcp(LP_MSG_OTA_BEGIN, beginBuf, 8)) {
+      sOtaError = true;
+      Serial.println("[ota] pad: TCP send failed");
+      return;
+    }
+    Serial.printf("[ota] pad DFU stream: %u bytes\n", fwSize);
+    if (!waitTcpAckLocal(5000)) {
+      sOtaError = true;
+      Serial.println("[ota] pad: OTA_BEGIN not ACK'd");
+      return;
+    }
+    Serial.println("[ota] pad: OTA_BEGIN ACK — streaming chunks");
+    sDfuStreamActive = true;
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (sOtaError || !sDfuStreamActive) return;
+    // On the very first write, validate the ESP image header.
+    if (sDfuStreamOff == 0 && sDfuStreamPos == 0 && up.currentSize >= 14) {
+      if (up.buf[0] != 0xE9) {
+        sOtaError = true;
+        Serial.printf("[ota] pad: bad magic 0x%02x\n", up.buf[0]);
+        return;
+      }
+      const uint16_t chipId = (uint16_t)up.buf[12] | ((uint16_t)up.buf[13] << 8);
+      if (chipId != 0x0002) {  // 0x0002 = ESP32-S2
+        sOtaError = true;
+        Serial.printf("[ota] pad: wrong chip 0x%04x (need ESP32-S2=0x0002)\n", chipId);
+        return;
+      }
+    }
+    // Buffer incoming bytes into kDfuChunkSize chunks and send each one.
+    size_t pos = 0;
+    while (pos < up.currentSize) {
+      const size_t copy = min((size_t)(kDfuChunkSize - sDfuStreamPos),
+                              (size_t)(up.currentSize - pos));
+      memcpy(sDfuStreamBuf + sDfuStreamPos, up.buf + pos, copy);
+      sDfuStreamPos += (uint16_t)copy;
+      pos           += copy;
+      if (sDfuStreamPos == kDfuChunkSize) {
+        if (!sendOneDfuChunk(sDfuStreamOff, sDfuStreamBuf, kDfuChunkSize)) {
+          sOtaError = true;
+          Serial.printf("[ota] pad: chunk @%u failed\n", sDfuStreamOff);
+          return;
+        }
+        sDfuStreamOff += kDfuChunkSize;
+        sDfuStreamPos  = 0;
+        if ((sDfuStreamOff % (64u * 1024u)) == 0) {
+          Serial.printf("[ota] pad dfu %u bytes streamed\n", sDfuStreamOff);
+        }
+      }
     }
   } else if (up.status == UPLOAD_FILE_END) {
-    if (sOtaFile) sOtaFile.close();
-    Serial.printf("[ota] pad upload done: %u bytes, err=%d\n", up.totalSize, sOtaError);
+    if (sOtaError || !sDfuStreamActive) return;
+    if (sDfuStreamPos > 0) {
+      if (!sendOneDfuChunk(sDfuStreamOff, sDfuStreamBuf, sDfuStreamPos)) {
+        sOtaError = true;
+        Serial.printf("[ota] pad: final chunk @%u failed\n", sDfuStreamOff);
+        return;
+      }
+      sDfuStreamOff += sDfuStreamPos;
+      sDfuStreamPos  = 0;
+    }
+    Serial.printf("[ota] pad DFU stream done: %u bytes\n", up.totalSize);
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    sOtaError        = true;
+    sDfuStreamActive = false;
+    Serial.println("[ota] pad: upload aborted");
   }
 }
-static bool streamDfuToPad();  // defined below, after handleOtaPadServe's slot
 static void handleOtaPadDone() {
-  if (sOtaError) { web.send(500, "text/plain", "upload failed"); return; }
-  if (!fsChipCheck(kOtaPadPath, 0x0002)) {  // 0x0002 = ESP32-S2
-    Serial.println("[ota] pad: chip ID check failed (not ESP32-S2)");
-    web.send(400, "text/plain", "error: expected ESP32-S2 binary for pad-esp32");
-    return;
-  }
-  if (!fsMagicCheck(kOtaPadPath, "pad-esp32")) {
-    Serial.println("[ota] pad: magic check failed (missing WTPFW:pad-esp32: ident)");
-    web.send(400, "text/plain", "error: firmware target mismatch (expected pad-esp32)");
-    return;
-  }
-  // Stream first, then respond — browser waits for the result rather than
-  // getting "streaming..." immediately with no final status.
-  if (streamDfuToPad()) {
-    web.send(200, "text/plain", "OK: pad updated and rebooted");
-  } else {
+  if (sOtaError) {
     web.send(500, "text/plain", "ERROR: pad DFU failed (check serial log)");
+  } else {
+    web.send(200, "text/plain", "OK: pad updated and rebooted");
   }
 }
 
@@ -1782,96 +1882,6 @@ static bool waitTcpAckLocal(uint32_t timeoutMs) {
   return false;
 }
 
-// Send LP_MSG_OTA_BEGIN to the pad, then stream the firmware as DFU chunks
-// over the same TCP link.  The pad flashes itself and reboots on success.
-// Wire format per chunk: [0xDF][0xC0][offset LE4][clen LE2][data][crc16 LE2]
-// Response per chunk: 0x06 ACK | 0x15 NAK (pad retransmits on NAK).
-// Blocks until the entire stream is ACK'd or an unrecoverable error occurs.
-static bool streamDfuToPad() {
-  File f = LittleFS.open(kOtaPadPath, "r");
-  if (!f) { Serial.println("[ota] pad bin missing"); return false; }
-  const uint32_t size = f.size();
-  if (size == 0) { f.close(); Serial.println("[ota] pad bin empty"); return false; }
-
-  // LP_MSG_OTA_BEGIN: [size LE4][reserved LE4]
-  uint8_t beginBuf[8];
-  writeU32Le(&beginBuf[0], size);
-  writeU32Le(&beginBuf[4], 0);
-  if (!sendFrameTcp(LP_MSG_OTA_BEGIN, beginBuf, 8)) {
-    f.close();
-    Serial.println("[ota] pad: TCP send failed — pad not connected");
-    return false;
-  }
-  Serial.printf("[ota] OTA_BEGIN -> pad, %u bytes\n", size);
-
-  if (!waitTcpAckLocal(5000)) {
-    f.close();
-    Serial.println("[ota] pad: OTA_BEGIN: no ACK from pad");
-    return false;
-  }
-  Serial.println("[ota] pad: OTA_BEGIN ACK'd — streaming DFU chunks");
-
-  uint8_t  chunk[kDfuChunkSize];
-  uint32_t offset = 0;
-  while (offset < size) {
-    const uint32_t rem  = size - offset;
-    const uint16_t clen = (rem > kDfuChunkSize) ? kDfuChunkSize : (uint16_t)rem;
-    f.seek(offset);
-    if (f.read(chunk, clen) != clen) {
-      Serial.println("[ota] pad: LittleFS read error");
-      f.close();
-      return false;
-    }
-    const uint16_t crc = lp_crc16_ccitt(chunk, clen);
-
-    bool ok = false;
-    for (uint8_t attempt = 0; attempt < kDfuMaxRetries && !ok; attempt++) {
-      const uint8_t hdr[8] = {
-        0xDF, 0xC0,
-        (uint8_t)(offset),        (uint8_t)(offset >> 8),
-        (uint8_t)(offset >> 16),  (uint8_t)(offset >> 24),
-        (uint8_t)(clen),          (uint8_t)(clen >> 8),
-      };
-      const uint8_t crcB[2] = { (uint8_t)(crc), (uint8_t)(crc >> 8) };
-      const int fd = padClient.fd();
-      if (fd < 0) {
-        Serial.println("[ota] pad: disconnected during DFU");
-        f.close();
-        return false;
-      }
-      ::send(fd, hdr,   sizeof(hdr), 0);
-      ::send(fd, chunk, clen,        0);
-      ::send(fd, crcB,  sizeof(crcB), 0);
-
-      const uint32_t t = millis() + kDfuChunkToutMs;
-      while (millis() < t) {
-        const int fd2 = padClient.fd();
-        if (fd2 < 0) break;  // socket gone
-        uint8_t rb;
-        const int rn = ::recv(fd2, &rb, 1, MSG_DONTWAIT);
-        if (rn == 1) {
-          if (rb == kDfuAckByte) { ok = true; break; }
-          if (rb == kDfuNakByte) { break; }  // retry
-        } else {
-          delay(1);
-        }
-      }
-    }
-
-    if (!ok) {
-      Serial.printf("[ota] pad: chunk @%u failed\n", offset);
-      f.close();
-      return false;
-    }
-    offset += clen;
-    if ((offset % (64 * 1024)) == 0 || offset == size) {
-      Serial.printf("[ota] pad dfu %u/%u bytes\n", offset, size);
-    }
-  }
-  f.close();
-  Serial.println("[ota] pad: DFU stream complete — pad is rebooting");
-  return true;
-}
 
 static void handleOtaConsoleUpload() {
   HTTPUpload& up = web.upload();
