@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Adafruit_TinyUSB.h>
+#include <Adafruit_NeoPixel.h>
 #include <Updater.h>
 #include <cstdarg>
 
@@ -148,6 +149,59 @@ static const char* kUsbManufacturer = "PDP LIMITED. ";
 static const char* kUsbProduct = "LEGO READER V2.10";
 static const char* kUsbSerial = "P.D.P.000000";
 
+static const uint16_t kXboxVid = 0x24c6;
+static const uint16_t kXboxPid = 0xfa01;
+static const char* kXboxManufacturer = "Warner Bros.";
+static const char* kXboxProduct = "LEGO(R) DIMENSIONS(TM)";
+static const char* kXboxSerial = "B61D757F";
+
+// XSM3 security string — confirmed at string index 4 on real Xbox 360 Toy Pad hardware.
+static const char kXsm3String[] =
+    "Xbox Security Method 3, Version 1.00, \xc2\xa9 2005 Microsoft Corporation. All rights reserved.";
+
+// Full 153-byte Xbox 360 Toy Pad configuration descriptor (verbatim from real hardware).
+static const uint8_t kXboxConfigDesc[153] = {
+  // Config descriptor (9)
+  0x09, 0x02, 0x99, 0x00, 0x04, 0x01, 0x00, 0x80, 0xFA,
+  // Interface 0: class=0xFF subclass=0x5D protocol=0x01, 2 endpoints (9)
+  0x09, 0x04, 0x00, 0x00, 0x02, 0xFF, 0x5D, 0x01, 0x00,
+  // Extra (17)
+  0x11, 0x21, 0x10, 0x01, 0x21, 0x25, 0x81, 0x14, 0x00, 0x00, 0x00, 0x00, 0x13, 0x01, 0x08, 0x00, 0x00,
+  // EP 0x81 IN interrupt 32B interval=4 (7)
+  0x07, 0x05, 0x81, 0x03, 0x20, 0x00, 0x04,
+  // EP 0x01 OUT interrupt 32B interval=4 (7)
+  0x07, 0x05, 0x01, 0x03, 0x20, 0x00, 0x04,
+  // Interface 1: class=0xFF subclass=0x5D protocol=0x03, 4 endpoints (9)
+  0x09, 0x04, 0x01, 0x00, 0x04, 0xFF, 0x5D, 0x03, 0x00,
+  // Extra (27)
+  0x1B, 0x21, 0x00, 0x01, 0x21, 0x01, 0x82, 0x20, 0x01, 0x02, 0x20, 0x16,
+  0x83, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  // EP 0x82 IN interrupt 32B interval=2 (7)
+  0x07, 0x05, 0x82, 0x03, 0x20, 0x00, 0x02,
+  // EP 0x02 OUT interrupt 32B interval=4 (7)
+  0x07, 0x05, 0x02, 0x03, 0x20, 0x00, 0x04,
+  // EP 0x83 IN interrupt 32B interval=32 (7)
+  0x07, 0x05, 0x83, 0x03, 0x20, 0x00, 0x20,
+  // EP 0x03 OUT interrupt 32B interval=16 (7)
+  0x07, 0x05, 0x03, 0x03, 0x20, 0x00, 0x10,
+  // Interface 2: class=0xFF subclass=0x5D protocol=0x02, 1 endpoint (9)
+  0x09, 0x04, 0x02, 0x00, 0x01, 0xFF, 0x5D, 0x02, 0x00,
+  // Extra (9)
+  0x09, 0x21, 0x00, 0x01, 0x21, 0x22, 0x84, 0x07, 0x00,
+  // EP 0x84 IN interrupt 32B interval=16 (7)
+  0x07, 0x05, 0x84, 0x03, 0x20, 0x00, 0x10,
+  // Interface 3: class=0xFF subclass=0xFD protocol=0x13, 0 endpoints, iInterface=4 (9)
+  0x09, 0x04, 0x03, 0x00, 0x00, 0xFF, 0xFD, 0x13, 0x04,
+  // Extra (6)
+  0x06, 0x41, 0x00, 0x01, 0x01, 0x03,
+};
+
+static const uint8_t kSwitchPin       = D0;
+static const uint8_t kStatusLedPin    = D1;
+static const uint8_t kNeoPixelPowerPin = 11;
+static const uint8_t kNeoPixelDataPin  = 12;
+static Adafruit_NeoPixel sNeoPixel(1, kNeoPixelDataPin, NEO_GRB + NEO_KHZ800);
+
 // Raw HID report descriptor used by the original reader.
 static const uint8_t kHidReportDesc[] = {
   0x06, 0x00, 0xff,  // Usage Page (Vendor)
@@ -188,9 +242,25 @@ struct UsbDescriptorPreset {
 
 static UsbDescriptorPreset gUsbDescriptorPreset;
 
+enum ToyPadProfile : uint8_t {
+  PROFILE_PLAYSTATION = 0,
+  PROFILE_XBOX360 = 1,
+};
+
+// Runtime profile: set from GPIO D0 in __wrap_TinyUSB_Device_Init (before setup()).
+static ToyPadProfile gActiveProfile = PROFILE_PLAYSTATION;
+
+static bool isXboxProfile() {
+  return gActiveProfile == PROFILE_XBOX360;
+}
+
 extern "C" uint8_t const* __real_tud_descriptor_configuration_cb(uint8_t index);
 
 extern "C" uint8_t const* __wrap_tud_descriptor_configuration_cb(uint8_t index) {
+  if (isXboxProfile()) {
+    return kXboxConfigDesc;
+  }
+
   const uint8_t* base = __real_tud_descriptor_configuration_cb(index);
   if (base == nullptr) {
     return base;
@@ -221,45 +291,138 @@ extern "C" uint8_t const* __wrap_tud_descriptor_configuration_cb(uint8_t index) 
   return patched;
 }
 
+extern "C" uint16_t const* __real_tud_descriptor_string_cb(uint8_t index, uint16_t langid);
+
+extern "C" uint16_t const* __wrap_tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
+  if (isXboxProfile() && index == 4) {
+    static uint16_t buf[128];
+    size_t j = 1;
+    for (const char* p = kXsm3String; *p && j < 127; p++) {
+      const uint8_t c = (uint8_t)*p;
+      if (c < 0x80) {
+        buf[j++] = (uint16_t)c;
+      } else if ((c & 0xE0) == 0xC0 && *(p + 1)) {
+        buf[j++] = (uint16_t)(((c & 0x1F) << 6) | (*(p + 1) & 0x3F));
+        p++;
+      }
+    }
+    buf[0] = (uint16_t)(0x0300 | (2 + 2 * (j - 1)));
+    return buf;
+  }
+  return __real_tud_descriptor_string_cb(index, langid);
+}
+
+// XSM3 control transfer handler. Called by TinyUSB for vendor control requests.
+// We stub all XSM3 commands so the Xbox 360 host believes auth succeeded.
+extern "C" bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
+                                            tusb_control_request_t const* request) {
+  if (!isXboxProfile()) return false;
+  if (request->bmRequestType_bit.type != TUSB_REQ_TYPE_VENDOR) return false;
+  // All XSM3 commands target interface 3.
+  if (request->wIndex != 3) return false;
+
+  static uint8_t xsm3Buf[20] = {0};
+
+  switch (request->bRequest) {
+    case 0x81:  // GET_IDENTITY (IN)
+      if (stage == CONTROL_STAGE_SETUP) {
+        xsm3Buf[0] = 0x01;
+        return tud_control_xfer(rhport, request, xsm3Buf, tu_min16(request->wLength, 20));
+      }
+      return true;
+    case 0x82:  // SEND_CHALLENGE1 (OUT)
+      if (stage == CONTROL_STAGE_SETUP)
+        return tud_control_xfer(rhport, request, xsm3Buf, request->wLength);
+      return true;
+    case 0x83:  // GET_RESPONSE1 (IN)
+      if (stage == CONTROL_STAGE_SETUP) {
+        memset(xsm3Buf, 0, 20);
+        return tud_control_xfer(rhport, request, xsm3Buf, tu_min16(request->wLength, 20));
+      }
+      return true;
+    case 0x84:  // AUTH_DONE (IN)
+      if (stage == CONTROL_STAGE_SETUP) {
+        xsm3Buf[0] = 0x00;
+        return tud_control_xfer(rhport, request, xsm3Buf, tu_min16(request->wLength, 4));
+      }
+      return true;
+    case 0x86:  // GET_STATUS (IN) — report 0x02 = ready/authenticated
+      if (stage == CONTROL_STAGE_SETUP) {
+        xsm3Buf[0] = 0x02;
+        return tud_control_xfer(rhport, request, xsm3Buf, tu_min16(request->wLength, 4));
+      }
+      return true;
+    case 0x87:  // SEND_CHALLENGE2 (OUT)
+      if (stage == CONTROL_STAGE_SETUP)
+        return tud_control_xfer(rhport, request, xsm3Buf, request->wLength);
+      return true;
+    default:
+      return false;  // STALL unknown requests
+  }
+}
+
 // Called after SET_CONFIGURATION is processed. No delay needed — tested up to
 // 2000ms with no effect on the RPCS3 passthrough issue.
 extern "C" void tud_set_configuration_cb(uint8_t cfg_num) {
   (void)cfg_num;
 }
 
+static void updateStatusOutputs(ToyPadProfile p) {
+  if (p == PROFILE_PLAYSTATION) {
+    digitalWrite(kStatusLedPin, HIGH);
+    sNeoPixel.setPixelColor(0, sNeoPixel.Color(0, 0, 255));  // blue = PS3
+  } else {
+    digitalWrite(kStatusLedPin, LOW);
+    sNeoPixel.setPixelColor(0, sNeoPixel.Color(0, 255, 0));  // green = Xbox 360
+  }
+  sNeoPixel.show();
+}
+
 extern "C" __attribute__((used)) void __wrap_TinyUSB_Device_Init(uint8_t rhport) {
-  // Start with reader identity.
-  TinyUSBDevice.setID(kUsbVid, kUsbPid);
-  TinyUSBDevice.setManufacturerDescriptor(kUsbManufacturer);
-  TinyUSBDevice.setProductDescriptor(kUsbProduct);
-  TinyUSBDevice.setSerialDescriptor(kUsbSerial);
+  // Read mode switch GPIO to determine profile at boot.
+  // D0 open (INPUT_PULLUP HIGH) = PS3, pulled LOW = Xbox 360.
+  pinMode(kSwitchPin, INPUT_PULLUP);
+  gActiveProfile = (digitalRead(kSwitchPin) == LOW) ? PROFILE_XBOX360 : PROFILE_PLAYSTATION;
+
+  if (isXboxProfile()) {
+    TinyUSBDevice.setID(kXboxVid, kXboxPid);
+    TinyUSBDevice.setManufacturerDescriptor(kXboxManufacturer);
+    TinyUSBDevice.setProductDescriptor(kXboxProduct);
+    TinyUSBDevice.setSerialDescriptor(kXboxSerial);
+  } else {
+    TinyUSBDevice.setID(kUsbVid, kUsbPid);
+    TinyUSBDevice.setManufacturerDescriptor(kUsbManufacturer);
+    TinyUSBDevice.setProductDescriptor(kUsbProduct);
+    TinyUSBDevice.setSerialDescriptor(kUsbSerial);
+  }
   TinyUSBDevice.begin(rhport);
 
-  // Convert default startup config to HID-only before normal setup() runs.
   TinyUSBDevice.detach();
   Serial.end();
   TinyUSBDevice.clearConfiguration();
-  usb_hid.setReportCallback(onHidGetReport, onHidSetReport);
-  usb_hid.begin();
 
-  // clearConfiguration() resets descriptors to compile-time defaults.
-  TinyUSBDevice.setID(kUsbVid, kUsbPid);
-  TinyUSBDevice.setManufacturerDescriptor(kUsbManufacturer);
-  TinyUSBDevice.setProductDescriptor(kUsbProduct);
-  TinyUSBDevice.setSerialDescriptor(kUsbSerial);
+  if (isXboxProfile()) {
+    // Xbox 360: vendor class only — no HID.
+    // tud_vendor_* functions handle data; kXboxConfigDesc returned by config CB.
+  } else {
+    usb_hid.setReportCallback(onHidGetReport, onHidSetReport);
+    usb_hid.begin();
+  }
+
+  // clearConfiguration() resets descriptors; re-apply after.
+  if (isXboxProfile()) {
+    TinyUSBDevice.setID(kXboxVid, kXboxPid);
+    TinyUSBDevice.setManufacturerDescriptor(kXboxManufacturer);
+    TinyUSBDevice.setProductDescriptor(kXboxProduct);
+    TinyUSBDevice.setSerialDescriptor(kXboxSerial);
+  } else {
+    TinyUSBDevice.setID(kUsbVid, kUsbPid);
+    TinyUSBDevice.setManufacturerDescriptor(kUsbManufacturer);
+    TinyUSBDevice.setProductDescriptor(kUsbProduct);
+    TinyUSBDevice.setSerialDescriptor(kUsbSerial);
+  }
   TinyUSBDevice.attach();
 }
-
-enum ToyPadProfile : uint8_t {
-  PROFILE_PLAYSTATION = 0,
-  PROFILE_XBOX360 = 1,
-};
-
-#ifdef TOY_PROFILE_XBOX360
-static const ToyPadProfile kActiveProfile = PROFILE_XBOX360;
-#else
-static const ToyPadProfile kActiveProfile = PROFILE_PLAYSTATION;
-#endif
 
 enum ToyPadCommand : uint8_t {
   TOY_CMD_B0 = 0xb0,
@@ -342,10 +505,7 @@ uint32_t b0SentCount = 0;
 
 static void handleToyCommand(const ToyPadOutPacket& p);
 static bool toyUsbSendInPacket(const uint8_t* packet);
-
-static bool isXboxProfile() {
-  return kActiveProfile == PROFILE_XBOX360;
-}
+static void performProfileSwitch(ToyPadProfile newProfile);
 
 static void onXboxDynamicB1(const ToyPadOutPacket& packet) {
   (void)packet;
@@ -447,6 +607,21 @@ static bool parseToyPacket(const uint8_t* packet, uint8_t len, ToyPadOutPacket* 
 static bool normalizeToyOutReport(const uint8_t* buffer, uint16_t bufsize,
                                   uint8_t outPacket[kToyPacketSize]) {
   if (buffer == nullptr || outPacket == nullptr) {
+    return false;
+  }
+
+  if (isXboxProfile()) {
+    // Xbox 360 OUT framing: [0x00, 0x14, 30 bytes payload].
+    if (bufsize >= 32 && buffer[0] == 0x00 && buffer[1] == 0x14) {
+      memset(outPacket, 0, kToyPacketSize);
+      memcpy(outPacket, buffer + 2, 30);
+      return outPacket[0] == kToyMagicHostToPortal;
+    }
+    // Also accept raw 32-byte format in case the host skips framing.
+    if (bufsize >= kToyPacketSize && buffer[0] == kToyMagicHostToPortal) {
+      memcpy(outPacket, buffer, kToyPacketSize);
+      return true;
+    }
     return false;
   }
 
@@ -649,6 +824,16 @@ static bool sendOrQueueToyReply(uint8_t counter, const uint8_t* payload, uint8_t
 static bool toyUsbSendInPacket(const uint8_t* packet) {
   if (packet == nullptr) return false;
   if (!TinyUSBDevice.mounted()) return false;
+  if (isXboxProfile()) {
+    // Xbox 360 IN framing: [0x0B, 0x14, 30 bytes payload].
+    uint8_t framed[32];
+    framed[0] = 0x0B;
+    framed[1] = 0x14;
+    memcpy(framed + 2, packet, 30);
+    const uint32_t n = tud_vendor_write(framed, 32);
+    tud_vendor_write_flush();
+    return n == 32;
+  }
   bool ok = usb_hid.sendReport(0, packet, kToyUsbReportSize);
   // NOTE: do NOT debugPrintf here — called from a tight retry loop; UART
   // flood would block Serial1.write(), stall loop(), and prevent
@@ -705,7 +890,7 @@ static void serviceToyInQueue() {
     uint8_t packet[kToyUsbReportSize];
     if (!peekToyInPacket(packet)) break;
     // One-shot diagnostic: capture pre-send state, then log with the result.
-    bool rdyBefore = !loggedFirstAttempt ? usb_hid.ready() : false;
+    bool rdyBefore = (!loggedFirstAttempt && !isXboxProfile()) ? usb_hid.ready() : false;
     bool ok = toyUsbSendInPacket(packet);
     if (!loggedFirstAttempt) {
       loggedFirstAttempt = true;
@@ -1225,14 +1410,48 @@ extern "C" void tud_mount_cb(void) {
   debugPrintf("usb mounted");
 }
 
+static void performProfileSwitch(ToyPadProfile newProfile) {
+  gActiveProfile = newProfile;
+  TinyUSBDevice.detach();
+  delay(500);
+  TinyUSBDevice.clearConfiguration();
+  if (newProfile == PROFILE_PLAYSTATION) {
+    TinyUSBDevice.setID(kUsbVid, kUsbPid);
+    TinyUSBDevice.setManufacturerDescriptor(kUsbManufacturer);
+    TinyUSBDevice.setProductDescriptor(kUsbProduct);
+    TinyUSBDevice.setSerialDescriptor(kUsbSerial);
+    usb_hid.setReportCallback(onHidGetReport, onHidSetReport);
+    usb_hid.begin();
+  } else {
+    TinyUSBDevice.setID(kXboxVid, kXboxPid);
+    TinyUSBDevice.setManufacturerDescriptor(kXboxManufacturer);
+    TinyUSBDevice.setProductDescriptor(kXboxProduct);
+    TinyUSBDevice.setSerialDescriptor(kXboxSerial);
+    // Vendor class activated by CFG_TUD_VENDOR=1; no explicit begin() needed.
+  }
+  TinyUSBDevice.attach();
+  updateStatusOutputs(newProfile);
+  debugPrintf("profile switch -> %s", isXboxProfile() ? "xbox360" : "ps");
+}
+
 void setup() {
+  // GPIO init — kSwitchPin already configured in __wrap_TinyUSB_Device_Init.
+  // gActiveProfile is already set from GPIO before setup() runs.
+  pinMode(kStatusLedPin, OUTPUT);
+  pinMode(kNeoPixelPowerPin, OUTPUT);
+  digitalWrite(kNeoPixelPowerPin, HIGH);
+  sNeoPixel.begin();
+  sNeoPixel.setBrightness(50);
+  updateStatusOutputs(gActiveProfile);
+
   Serial1.begin(kUartBaud);  // UART from console ESP32
   lp_stream_init(&uartParser);
 
   Serial1.println(kFwIdent);  // log firmware ident on boot
   debugPrintf("boot profile=%s", isXboxProfile() ? "xbox360" : "ps");
-  debugPrintf("usb vid=0x%04x pid=0x%04x", kUsbVid, kUsbPid);
-
+  debugPrintf("usb vid=0x%04x pid=0x%04x",
+              isXboxProfile() ? kXboxVid : kUsbVid,
+              isXboxProfile() ? kXboxPid : kUsbPid);
 }
 
 // Called by TinyUSB from USB IRQ context (usb_task_irq → tud_task) immediately
@@ -1247,6 +1466,7 @@ extern "C" void tud_hid_report_complete_cb(uint8_t instance,
   (void)instance;
   (void)report;
   (void)len;
+  if (isXboxProfile()) return;  // Xbox uses vendor endpoint, not HID
   if (toyInQueue.count == 0) return;
   if (!TinyUSBDevice.mounted()) return;
   uint8_t packet[kToyUsbReportSize];
@@ -1331,6 +1551,36 @@ void loop() {
     TinyUSBDevice.task();
     serviceToyInQueue();
     return;  // skip LP heartbeats while DFU is in progress
+  }
+
+  // ── GPIO mode-switch debounce ────────────────────────────────────────────────
+  {
+    static uint32_t switchDebounceMs = 0;
+    static bool switchLastRaw = true;  // HIGH = PS3 side (pulled up)
+    const bool rawPin = (bool)digitalRead(kSwitchPin);
+    if (rawPin != switchLastRaw) {
+      switchLastRaw = rawPin;
+      switchDebounceMs = now;
+    }
+    const ToyPadProfile pinProfile = (rawPin == LOW) ? PROFILE_XBOX360 : PROFILE_PLAYSTATION;
+    if ((now - switchDebounceMs) >= 50 && pinProfile != gActiveProfile) {
+      performProfileSwitch(pinProfile);
+    }
+  }
+
+  // ── Xbox vendor OUT receive path ─────────────────────────────────────────────
+  if (isXboxProfile()) {
+    while (tud_vendor_available() >= 32) {
+      uint8_t buf[32];
+      tud_vendor_read(buf, 32);
+      uint8_t normalized[kToyPacketSize];
+      if (normalizeToyOutReport(buf, 32, normalized)) {
+        ToyPadOutPacket pkt = {};
+        if (parseToyPacket(normalized, kToyPacketSize, &pkt)) {
+          handleToyCommand(pkt);
+        }
+      }
+    }
   }
 
   while (Serial1.available()) {
