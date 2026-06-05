@@ -40,6 +40,23 @@ PS4 / Xbox 360 USB port
 | `D6` (TX / Serial1) | UART TX | `GPIO16` (U2RXD) |
 | `D7` (RX / Serial1) | UART RX | `GPIO17` (U2TXD) |
 
+### Additional pins — console-rp2040 (XIAO RP2040)
+
+These pins are used for the profile switch and status indicators on the XIAO
+RP2040 (PS3 vs Xbox 360 USB profile selection):
+
+| XIAO RP2040 pin | GPIO | Signal | Notes |
+|-----------------|------|--------|-------|
+| `D0` | 26 | Mode switch | `INPUT_PULLUP`; open/HIGH = PS3, pulled LOW = Xbox 360 |
+| `D1` | 27 | PS3 status LED | HIGH = on when PS3 profile is active |
+| `D2` | 28 | Xbox 360 status LED | HIGH = on when Xbox 360 profile is active |
+| `11` | 11 | NeoPixel power enable | Drive HIGH to power the onboard NeoPixel |
+| `12` | 12 | NeoPixel data | WS2812, 1 pixel; blue = PS3, green = Xbox 360 |
+
+Connect a discrete LED (with series resistor, e.g. 330 Ω to GND) to each of
+`D1` and `D2`. Only one LED is on at a time, immediately reflecting the active
+USB profile. The NeoPixel mirrors the same state in colour.
+
 > **Serial port:** The firmware uses `Serial1` on the RP2040 and `Serial2`
 > (`HardwareSerial(2)`) on the ESP32 — both at 115 200 baud.
 
@@ -124,6 +141,62 @@ External 5 V supply ────────────────────
 | **Total** | **160 mA** | **400 mA** |
 
 A USB power bank or any 5 V charger at 500 mA is sufficient.
+
+---
+
+## 2e. Status Indicator and Mode Button — Pad Side
+
+A common-anode RGB LED and a push-button are added to the S2 Mini to show
+connection/mode status and allow switching between physical-pad and emulator
+mode without a computer.
+
+### Wiring
+
+```
+ESP32-S2 Mini header                        Component
+─────────────────────────────────────────────────────────────────────
+GPIO 11  ───[330 Ω]──► RGB LED Red anode leg
+GPIO 12  ───[330 Ω]──► RGB LED Green anode leg
+GPIO 13  ───[330 Ω]──► RGB LED Blue anode leg
+                        RGB LED Common Anode (+) ──► 3.3 V
+
+GPIO 14  ───────────── Button one terminal
+GND      ───────────── Button other terminal
+```
+
+> **Common-anode LED:** the shared anode (+) is tied to 3.3 V.
+> Driving a pin **LOW** turns that colour **on**; **HIGH** turns it **off**.
+> An internal `INPUT_PULLUP` is used for the button so no external resistor
+> is needed — pressing the button pulls GPIO 14 to GND (active-low).
+
+### Pin reference — pad-esp32 (ESP32-S2 Mini)
+
+| GPIO | Signal | Direction | Notes |
+|------|--------|-----------|-------|
+| `11` | RGB Red | Output | LOW = on (common-anode) |
+| `12` | RGB Green | Output | LOW = on |
+| `13` | RGB Blue | Output | LOW = on |
+| `14` | Mode button | Input (PULLUP) | LOW = pressed |
+
+### LED colour states
+
+| Colour | Meaning |
+|--------|---------|
+| **Yellow** (Red + Green) | Not connected to console |
+| **Green** | Connected — physical passthrough mode (physical Toy Pad active) |
+| **Magenta** (Red + Blue) | Connected — emulator mode (console-esp32 manages virtual toys) |
+
+### Mode switching
+
+Pressing the button sends a toggle request (`LP_MSG_SET_MODE`) to the
+console-esp32 over the existing WiFi/LP link.  The console-esp32 is the
+authority on the current mode: it updates its own `runtimeMode`, persists it
+to flash, clears stale slot state on the RP2040 if needed, and replies with
+the new mode.  The pad-esp32 then updates its LED to reflect the confirmed
+mode.
+
+The mode can also be changed at any time from the console-esp32 web UI
+(`/api/mode`); the pad LED will update automatically.
 
 ---
 

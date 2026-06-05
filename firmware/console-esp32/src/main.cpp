@@ -1339,6 +1339,11 @@ static void handleApiMode() {
       sendFrameTcp(LP_MSG_LED_CMD, offPayload, sizeof(offPayload));
     }
   }
+  // Notify pad-esp32 of the new mode so it can update its RGB LED.
+  if (padKnown && padPaired) {
+    const uint8_t modeNotify[1] = {(uint8_t)runtimeMode};
+    sendFrameTcp(LP_MSG_SET_MODE, modeNotify, sizeof(modeNotify));
+  }
 
   web.send(200, "text/plain", "ok");
 }
@@ -2203,6 +2208,9 @@ static void processTcpIn() {
       uint8_t pairPayload[4];
       writeU32Le(pairPayload, sharedSecret);
       sendFrameTcp(LP_MSG_PAIR_SET, pairPayload, sizeof(pairPayload));
+      // Immediately notify pad of the current runtime mode.
+      const uint8_t modeNotify[1] = {(uint8_t)runtimeMode};
+      sendFrameTcp(LP_MSG_SET_MODE, modeNotify, sizeof(modeNotify));
 
       Serial.print("[console-esp32] paired with ");
       Serial.println(padIp);
@@ -2255,6 +2263,28 @@ static void processTcpIn() {
           strlcpy(sPadD2Debug, msg, sizeof(sPadD2Debug));
         }
       }
+      continue;
+    }
+
+    // SET_MODE from pad button: toggle or set runtimeMode, respond with new mode.
+    if (frame.header.type == LP_MSG_SET_MODE && frame.header.length == 1) {
+      const RuntimeMode prevMode = runtimeMode;
+      if (frame.payload[0] == 0xFF) {
+        runtimeMode = (runtimeMode == MODE_PASSTHROUGH) ? MODE_EMULATOR : MODE_PASSTHROUGH;
+      } else {
+        runtimeMode = (frame.payload[0] == 1) ? MODE_PASSTHROUGH : MODE_EMULATOR;
+      }
+      if (runtimeMode != prevMode) {
+        saveMode();
+        if (runtimeMode == MODE_EMULATOR) {
+          sendFrameUart(LP_MSG_TAG_CLEAR, nullptr, 0);
+          const uint8_t offPayload[4] = {0xff, 0, 0, 0};
+          sendFrameTcp(LP_MSG_LED_CMD, offPayload, sizeof(offPayload));
+        }
+        Serial.printf("[console] mode set from pad button: %s\n", modeToString(runtimeMode));
+      }
+      const uint8_t modeNotify[1] = {(uint8_t)runtimeMode};
+      sendFrameTcp(LP_MSG_SET_MODE, modeNotify, sizeof(modeNotify));
       continue;
     }
 

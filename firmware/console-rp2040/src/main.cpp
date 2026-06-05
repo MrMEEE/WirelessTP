@@ -196,8 +196,9 @@ static const uint8_t kXboxConfigDesc[153] = {
   0x06, 0x41, 0x00, 0x01, 0x01, 0x03,
 };
 
-static const uint8_t kSwitchPin       = D0;
-static const uint8_t kStatusLedPin    = D1;
+static const uint8_t kSwitchPin        = D0;
+static const uint8_t kPsLedPin         = D1;  // HIGH = on when PS3 profile active
+static const uint8_t kXboxLedPin       = D2;  // HIGH = on when Xbox 360 profile active
 static const uint8_t kNeoPixelPowerPin = 11;
 static const uint8_t kNeoPixelDataPin  = 12;
 static Adafruit_NeoPixel sNeoPixel(1, kNeoPixelDataPin, NEO_GRB + NEO_KHZ800);
@@ -369,10 +370,12 @@ extern "C" void tud_set_configuration_cb(uint8_t cfg_num) {
 
 static void updateStatusOutputs(ToyPadProfile p) {
   if (p == PROFILE_PLAYSTATION) {
-    digitalWrite(kStatusLedPin, HIGH);
+    digitalWrite(kPsLedPin,    HIGH);  // PS LED on
+    digitalWrite(kXboxLedPin,  LOW);   // Xbox LED off
     sNeoPixel.setPixelColor(0, sNeoPixel.Color(0, 0, 255));  // blue = PS3
   } else {
-    digitalWrite(kStatusLedPin, LOW);
+    digitalWrite(kPsLedPin,    LOW);   // PS LED off
+    digitalWrite(kXboxLedPin,  HIGH);  // Xbox LED on
     sNeoPixel.setPixelColor(0, sNeoPixel.Color(0, 255, 0));  // green = Xbox 360
   }
   sNeoPixel.show();
@@ -1437,7 +1440,8 @@ static void performProfileSwitch(ToyPadProfile newProfile) {
 void setup() {
   // GPIO init — kSwitchPin already configured in __wrap_TinyUSB_Device_Init.
   // gActiveProfile is already set from GPIO before setup() runs.
-  pinMode(kStatusLedPin, OUTPUT);
+  pinMode(kPsLedPin,    OUTPUT);
+  pinMode(kXboxLedPin,  OUTPUT);
   pinMode(kNeoPixelPowerPin, OUTPUT);
   digitalWrite(kNeoPixelPowerPin, HIGH);
   sNeoPixel.begin();

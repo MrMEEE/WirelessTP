@@ -46,6 +46,10 @@ static const uint16_t kSetupPort        = 80;
 static const uint16_t kDnsPort          = 53;
 static const int      kResetPin         = 0;
 static const uint32_t kResetHoldMs     = 3000;
+static const uint8_t  kRgbRedPin        = 11;  // common-anode RGB — LOW = on
+static const uint8_t  kRgbGreenPin      = 12;
+static const uint8_t  kRgbBluePin       = 13;
+static const uint8_t  kModeButtonPin    = 14;  // INPUT_PULLUP, LOW = pressed
 // Batman (DC Comics) toy-ID — placing him in center during CONN_BLINK_FAIL reopens setup portal.
 static const uint32_t kGestureResetToyId = 1;
 static const uint16_t kConsolePort     = 25100;
@@ -109,6 +113,16 @@ enum ConnState : uint8_t {
   CONN_BLINK_FAIL,
   CONN_PAIRED,
 };
+
+// Operating mode toggled by the physical button on GPIO 14.
+//   PASSTHROUGH : physical toypad USB events forwarded to console (default)
+//   VIRTUAL     : physical events suppressed; only serial-menu virtual toys active
+enum PadMode : uint8_t {
+  PAD_MODE_EMULATOR    = 0,  // virtual toypad — console-esp32 manages toys (mirrors RuntimeMode)
+  PAD_MODE_PASSTHROUGH = 1,  // physical NFC pad active
+};
+static PadMode sPadMode = PAD_MODE_EMULATOR;  // default matches console-esp32 default
+static void setModeLed(bool connected, PadMode mode);  // forward decl — defined near setup()
 
 // ─── Structs ──────────────────────────────────────────────────────────────────
 struct PadConfig {
@@ -2078,8 +2092,61 @@ static void processTcpIn(uint32_t now) {
       continue;
     }
 
+    // SET_MODE — console notifies us of the current runtime mode
+    if (frame.header.type == LP_MSG_SET_MODE && frame.header.length == 1) {
+      sPadMode = (PadMode)frame.payload[0];
+      setModeLed(paired, sPadMode);
+      sendAck(frame.header.seq);
+      Serial.printf("[pad] mode: %s\n",
+                    sPadMode == PAD_MODE_PASSTHROUGH ? "passthrough" : "emulator");
+      continue;
+    }
+
     // Everything else: ack and ignore
     sendAck(frame.header.seq);
+  }
+}
+
+// ─── Mode LED + button ───────────────────────────────────────────────────────
+// Common-anode RGB: LOW drives current through the colour, HIGH = off.
+// Common-anode RGB: LOW = colour on, HIGH = off.
+// Not connected : Red+Green (yellow).
+// Passthrough   : Green (physical pad active).
+// Emulator      : Red+Blue (virtual/emulator mode).
+static void setModeLed(bool connected, PadMode mode) {
+  if (!connected) {
+    digitalWrite(kRgbRedPin,   LOW);   // R on  }
+    digitalWrite(kRgbGreenPin, LOW);   // G on  } yellow
+    digitalWrite(kRgbBluePin,  HIGH);  // B off }
+  } else if (mode == PAD_MODE_PASSTHROUGH) {
+    digitalWrite(kRgbRedPin,   HIGH);  // R off }
+    digitalWrite(kRgbGreenPin, LOW);   // G on  } green
+    digitalWrite(kRgbBluePin,  HIGH);  // B off }
+  } else {
+    digitalWrite(kRgbRedPin,   LOW);   // R on  }
+    digitalWrite(kRgbGreenPin, HIGH);  // G off } red+blue (magenta)
+    digitalWrite(kRgbBluePin,  LOW);   // B on  }
+  }
+}
+
+// Button sends a toggle-request to console-esp32; console owns the mode
+// decision and responds with LP_MSG_SET_MODE carrying the authoritative mode.
+static void serviceModeButton(uint32_t now) {
+  static uint32_t debounceMs    = 0;
+  static bool     lastRaw       = true;   // HIGH = released (INPUT_PULLUP)
+  static bool     lastDebounced = true;
+
+  const bool rawPin = (bool)digitalRead(kModeButtonPin);
+  if (rawPin != lastRaw) { lastRaw = rawPin; debounceMs = now; }
+  if ((now - debounceMs) < 50) return;
+  if (rawPin == lastDebounced) return;
+  lastDebounced = rawPin;
+  if (rawPin != LOW) return;  // act on press
+
+  if (paired) {
+    const uint8_t payload[1] = {0xFF};  // 0xFF = toggle request
+    sendFrame(LP_MSG_SET_MODE, payload, 1, false);
+    Serial.println("[pad] mode toggle -> console");
   }
 }
 
@@ -2093,6 +2160,13 @@ void setup() {
   Serial.printf("[pad] boot, reset reason: %u\n", sBootReason);
 
   pinMode(kResetPin, INPUT_PULLUP);  // BOOT button — monitored by serviceFactoryReset()
+
+  // RGB status LED (common anode) and mode-switch button.
+  pinMode(kRgbRedPin,    OUTPUT);
+  pinMode(kRgbGreenPin,  OUTPUT);
+  pinMode(kRgbBluePin,   OUTPUT);
+  pinMode(kModeButtonPin, INPUT_PULLUP);
+  setModeLed(false, sPadMode);  // start as not connected
 
   cfg = loadConfig();
   if (!cfg.valid) runProvisioningPortal();  // blocks until saved+reboot
@@ -2126,6 +2200,7 @@ void loop() {
   const uint32_t now = millis();
 
   serviceFactoryReset();
+  serviceModeButton(now);
   processTcpIn(now);
 #if PAD_USB_HOST
   flushPendingLed();
@@ -2255,11 +2330,13 @@ void loop() {
         blinkLastMs = 0;
         helloStartMs = now;
         connState  = CONN_BLINK_FAIL;
+        setModeLed(false, sPadMode);  // show not-connected colour
         startBlink(kBlinkCount);
       }
 
 #if PAD_USB_HOST
-      // Drain physical tag event queue
+      // Drain physical tag event queue — console-esp32 gates events based on
+      // its runtimeMode, so we forward unconditionally and let it decide.
       {
         TagEvent evt;
         while (xQueueReceive(sTagQueue, &evt, 0) == pdTRUE) {
